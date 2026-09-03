@@ -1,2 +1,310 @@
-# FastMCP
-Tutorial for fastmcp
+# es-search-mcp
+
+백엔드 팀이 만든 **Elasticsearch 검색 API**를 [FastMCP](https://gofastmcp.com) 서버로
+감싸서, MCP 클라이언트(Claude Desktop, Claude Code 등)가 도구로 호출할 수 있게 만든
+프로젝트입니다.
+
+백엔드의 두 엔드포인트를 각각 하나의 MCP 도구로 노출합니다.
+
+| MCP 도구 | 백엔드 엔드포인트 | 하는 일 |
+| --- | --- | --- |
+| `list_indices` | `GET /indices` | 검색 가능한 인덱스 이름과 설명을 반환 |
+| `retrieve_documents` | `POST /retrieve` | 특정 인덱스에서 질의에 맞는 문서를 검색 |
+
+두 도구 모두 읽기 전용(`readOnlyHint`)이며, 구조화 로깅과 중앙집중식 에러 처리를
+거칩니다.
+
+---
+
+## 1. 아키텍처
+
+```
+MCP 클라이언트
+      │  (stdio / http)
+      ▼
+┌──────────────────────────────────────────────┐
+│ server.py          컴포지션 루트              │
+│  ├─ middleware.py  호출 로깅 · 에러 백스톱     │
+│  └─ tools/         MCP 도구 정의              │
+│       ├─ indices.py     list_indices          │
+│       └─ retrieve.py    retrieve_documents    │
+│            │                                  │
+│            ├─ errors.py     도구 에러 경계     │
+│            ▼                                  │
+│      backend/client.py  HTTP · 재시도 · 에러변환│
+│            │                                  │
+│      models.py      응답 정규화 (Pydantic)     │
+└──────────────────────────────────────────────┘
+      │  HTTPS
+      ▼
+백엔드 검색 API ──▶ Elasticsearch
+```
+
+계층별 책임은 다음과 같습니다.
+
+| 모듈 | 책임 |
+| --- | --- |
+| `config.py` | 환경변수 기반 설정 (`ES_MCP_*`), 검증과 정규화 |
+| `logging.py` | 구조화 로깅, 호출 상관관계(correlation) 컨텍스트, 민감정보 마스킹 |
+| `exceptions.py` | 도메인 예외 계층과 안정적인 에러 코드 |
+| `errors.py` | 도메인 예외 → 클라이언트에게 보낼 `ToolError` 변환 경계 |
+| `models.py` | 백엔드 응답을 MCP 클라이언트용 스키마로 정규화 |
+| `backend/client.py` | HTTP 호출, 타임아웃, 재시도, 상태코드 → 도메인 예외 매핑 |
+| `middleware.py` | 도구 호출 단위 로깅, 도구 바깥에서 난 에러의 백스톱 |
+| `tools/` | MCP 도구 정의 (입력 검증 + 백엔드 호출 + 결과 로깅) |
+| `server.py` | 설정·클라이언트·미들웨어·도구를 조립하는 유일한 진입점 |
+
+**의존성은 명시적으로 주입합니다.** 도구는 `register(mcp, client, settings)` 형태로
+등록되며 전역 상태를 참조하지 않습니다. 덕분에 테스트에서 스텁 클라이언트를 그대로
+꽂아 넣을 수 있습니다.
+
+---
+
+## 2. 백엔드 API 계약
+
+이 서버가 기대하는 백엔드 응답 형태입니다. 백엔드가 다른 이름을 쓰더라도
+`models.py`가 흔한 별칭을 흡수하므로, 대부분의 경우 코드 수정 없이 붙습니다.
+
+### `GET /indices`
+
+```json
+[
+  { "name": "faq", "description": "고객 FAQ 문서", "document_count": 1240 },
+  { "name": "manuals", "description": "제품 매뉴얼" }
+]
+```
+
+* 허용 별칭: `name` / `index` / `index_name`, `description` / `desc` / `summary`,
+  `document_count` / `doc_count` / `count`
+* 봉투(envelope) 형태도 허용: `{"indices": [...]}`, `{"items": [...]}`,
+  `{"data": [...]}`, `{"results": [...]}`
+
+### `POST /retrieve`
+
+요청 본문:
+
+```json
+{ "index": "faq", "query": "환불 규정", "top_k": 5, "filters": { "lang": "ko" } }
+```
+
+`filters`는 값이 있을 때만 포함됩니다. 응답:
+
+```json
+{
+  "documents": [
+    { "id": "doc-1", "score": 1.82, "content": "환불은 ...", "metadata": { "lang": "ko" } }
+  ]
+}
+```
+
+* 허용 별칭: `id` / `_id` / `doc_id`, `score` / `_score`, `content` / `text` / `body` /
+  `chunk`, `metadata` / `meta` / `_source`
+* 봉투 형태도 허용: `{"documents": [...]}`, `{"hits": [...]}`, `{"results": [...]}`,
+  Elasticsearch 원형인 `{"hits": {"hits": [...]}}`
+
+파싱할 수 없는 응답은 `BACKEND_INVALID_PAYLOAD` 에러가 됩니다. 백엔드가 위 형태에서
+많이 벗어난다면 `models.py`의 별칭만 손보면 됩니다.
+
+---
+
+## 3. 설정
+
+모든 설정은 `ES_MCP_` 접두사를 가진 환경변수 또는 `.env` 파일로 주입합니다.
+전체 목록과 기본값은 [`.env.example`](.env.example)에 있습니다.
+
+```bash
+cp .env.example .env
+```
+
+자주 쓰는 값:
+
+| 환경변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `ES_MCP_BACKEND_BASE_URL` | `http://localhost:8000` | 백엔드 API 주소 |
+| `ES_MCP_BACKEND_API_KEY` | *(없음)* | 있으면 `Authorization: Bearer ...`로 전송 |
+| `ES_MCP_REQUEST_TIMEOUT` | `30.0` | 요청당 타임아웃(초) |
+| `ES_MCP_MAX_RETRIES` | `2` | 일시적 실패에 대한 재시도 횟수 |
+| `ES_MCP_DEFAULT_TOP_K` / `ES_MCP_MAX_TOP_K` | `5` / `50` | 검색 결과 개수 기본값과 상한 |
+| `ES_MCP_LOG_LEVEL` / `ES_MCP_LOG_FORMAT` | `INFO` / `json` | 로그 레벨과 형식 |
+| `ES_MCP_MASK_ERROR_DETAILS` | `true` | 예기치 못한 에러의 내부 정보를 감출지 여부 |
+| `ES_MCP_TRANSPORT` | `stdio` | `stdio`, `http`, `sse` |
+
+---
+
+## 4. 실행
+
+```bash
+uv sync --all-groups     # 의존성 설치
+uv run es-search-mcp     # 또는: uv run python -m es_search_mcp
+```
+
+HTTP 트랜스포트로 띄우려면:
+
+```bash
+ES_MCP_TRANSPORT=http ES_MCP_PORT=8080 uv run es-search-mcp
+```
+
+### MCP 클라이언트 등록 (stdio)
+
+```json
+{
+  "mcpServers": {
+    "es-search": {
+      "command": "uv",
+      "args": ["--directory", "/절대/경로/FastMCP", "run", "es-search-mcp"],
+      "env": {
+        "ES_MCP_BACKEND_BASE_URL": "https://search-api.internal",
+        "ES_MCP_BACKEND_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+---
+
+## 5. 커스텀 로깅
+
+`logging.py`가 담당하며, 설계상 두 가지 제약을 지킵니다.
+
+1. **로그는 항상 stderr로 나갑니다.** `stdio` 트랜스포트에서 stdout은 JSON-RPC
+   프로토콜 전용이라, 한 줄이라도 섞이면 통신이 깨집니다. `StderrHandler`는 매 출력마다
+   `sys.stderr`를 다시 조회하므로, 프로세스가 스트림을 교체해도 안전합니다.
+2. **도구 호출 하나가 상관관계의 단위입니다.** `request_id`, `tool_name`, `client_id`를
+   `ContextVar`에 담아 두고, 호출이 살아 있는 동안 발생한 모든 레코드에 자동으로
+   덧붙입니다. 로거를 인자로 들고 다닐 필요가 없습니다.
+
+`ES_MCP_LOG_FORMAT=json`일 때 한 줄이 하나의 JSON 객체입니다.
+
+```json
+{"timestamp":"2026-09-03T00:34:57Z","level":"INFO","logger":"es_search_mcp.middleware",
+ "event":"tool.call.start","arguments":{"index":"faq","query":"환불"},
+ "request_id":"8accd74976a34db7","tool_name":"retrieve_documents"}
+```
+
+주요 이벤트:
+
+| 이벤트 | 의미 |
+| --- | --- |
+| `server.starting` / `server.stopped` | 라이프스팬 시작·종료 |
+| `tool.call.start` / `tool.call.finished` | 도구 호출 시작·성공 (`duration_ms` 포함) |
+| `tool.call.failed` / `tool.call.crashed` | 분류된 실패 / 예상 못 한 실패 |
+| `backend.request` / `backend.response` | 백엔드 호출 (`status_code`, `elapsed_ms`) |
+| `backend.retry` | 재시도 (`attempt`, `delay_seconds`, `error_code`) |
+| `tool.error` / `tool.unhandled_error` | 에러 경계가 잡은 실패의 상세 |
+
+`request_id`는 백엔드로 나가는 요청의 `X-Request-ID` 헤더로도 전달되므로, MCP 서버
+로그와 백엔드 로그를 같은 키로 이어 붙일 수 있습니다.
+
+`api_key`, `authorization`, `password`, `secret`, `token` 필드는 출력 직전에
+`***`로 치환됩니다 (`SENSITIVE_KEYS`).
+
+사용법:
+
+```python
+from es_search_mcp.logging import get_logger
+
+logger = get_logger(__name__)
+logger.info("backend.request", fields={"method": "GET", "path": "/indices"})
+```
+
+---
+
+## 6. 커스텀 에러 처리
+
+### 예외 계층
+
+모든 실패는 `SearchMCPError`의 하위 타입으로 표현하고, 각각 **안정적인 코드**와
+**재시도 가능 여부**를 갖습니다.
+
+| 에러 코드 | 언제 | 재시도 |
+| --- | --- | --- |
+| `INVALID_INPUT` | 도구 인자가 잘못됨 (백엔드 호출 전에 차단) | ✗ |
+| `CONFIGURATION_ERROR` | 서버 설정이 잘못됨 | ✗ |
+| `BACKEND_UNAVAILABLE` | 백엔드에 연결 불가 | ✓ |
+| `BACKEND_TIMEOUT` | 타임아웃 | ✓ |
+| `BACKEND_UNAUTHORIZED` | 401 / 403 | ✗ |
+| `BACKEND_NOT_FOUND` | 404 | ✗ |
+| `BACKEND_RATE_LIMITED` | 429 | ✓ |
+| `BACKEND_BAD_REQUEST` | 그 밖의 4xx | ✗ |
+| `BACKEND_SERVER_ERROR` | 5xx | ✓ |
+| `BACKEND_INVALID_PAYLOAD` | 응답을 해석할 수 없음 | ✗ |
+| `INTERNAL_ERROR` | 예상하지 못한 예외 | ✗ |
+
+### 처리 경계
+
+```
+tools/*.py         async with tool_error_boundary():   ← 실제 변환이 일어나는 곳
+      ▼
+errors.py          SearchMCPError → ToolError("[CODE] 메시지")
+                   그 밖의 예외     → 로그(traceback) + 일반 메시지
+      ▼
+middleware.py      도구 "바깥"에서 난 에러의 백스톱 + 호출 결과 로깅
+```
+
+변환이 미들웨어가 아니라 **도구 본문 안**에서 일어나는 이유가 있습니다. FastMCP는
+도구에서 빠져나온 예외를 미들웨어가 보기 **전에** 가로채서
+`Error calling tool '...'`로 덮어씁니다. 따라서 유용한 메시지를 남기려면 그보다 안쪽,
+즉 도구 본문에서 잡아야 합니다.
+
+클라이언트가 받는 메시지는 항상 다음 형태입니다.
+
+```
+[BACKEND_TIMEOUT] The backend API did not respond within 30s. The request may succeed if retried.
+[INVALID_INPUT] `query` must not be empty. Provide the text to search for.
+```
+
+접두사 코드로 모델이 "다시 시도할 것"과 "인자를 고칠 것"을 구분할 수 있습니다.
+
+### 정보 노출 차단
+
+`ES_MCP_MASK_ERROR_DETAILS=true`(기본값)일 때, 예상하지 못한 예외는 클라이언트에게
+단일한 일반 메시지로만 전달되고 원본은 traceback과 함께 로그에만 남습니다. 백엔드
+에러 응답 본문도 마찬가지로 로그에만 기록되고 클라이언트로는 나가지 않습니다.
+개발 중에는 `false`로 두면 원본 메시지가 그대로 보입니다.
+
+### 재시도
+
+`backend/client.py`가 재시도 가능한 에러(연결 실패, 타임아웃, 429, 5xx)에 대해서만
+**full jitter 지수 백오프**로 재시도합니다. 재시도할 수 없는 에러는 즉시 올라갑니다.
+
+---
+
+## 7. 개발
+
+```bash
+uv sync --all-groups
+
+uv run pytest              # 테스트
+uv run ruff check .        # 린트
+uv run ruff format .       # 포매팅
+uv run mypy                # 타입 검사 (strict)
+```
+
+### 규칙
+
+* **레이어를 건너뛰지 않습니다.** 도구는 `backend/client.py`를 통해서만 네트워크에
+  접근하고, `httpx` 예외가 도구 계층까지 올라오지 않습니다.
+* **새 실패 모드는 `exceptions.py`에 코드와 함께 추가합니다.** 문자열 메시지로만
+  구분하지 않습니다.
+* **로그는 `logger.info("event.name", fields={...})` 형태로 남깁니다.** 메시지에
+  값을 문자열 보간하지 않습니다 — 이벤트 이름은 검색 가능한 상수여야 합니다.
+* **도구 docstring은 모델이 읽는 문서입니다.** 언제 이 도구를 쓰는지, 다른 도구와
+  어떤 순서로 쓰는지를 적습니다. 반환 스키마는 Pydantic 모델이 담당합니다.
+* **모든 도구 본문은 `tool_error_boundary()`로 감쌉니다.**
+* `tools/` 모듈은 `from __future__ import annotations`를 쓰지 않습니다. 도구 시그니처는
+  등록 시점에 평가되어 MCP 입력 스키마가 되는데, 지연 평가된 문자열 애노테이션은
+  클로저 변수(`settings`)를 해석하지 못합니다.
+
+### 테스트
+
+| 파일 | 범위 |
+| --- | --- |
+| `test_config.py` | 설정 정규화와 검증 |
+| `test_models.py` | 백엔드 응답 별칭·봉투 정규화 |
+| `test_backend_client.py` | 상태코드 → 예외 매핑, 재시도, 헤더 전파 (`respx`) |
+| `test_errors.py` | 에러 경계의 변환과 마스킹 |
+| `test_logging.py` | 포맷터, 컨텍스트 바인딩, 마스킹, stderr 보장 |
+| `test_server_tools.py` | 인메모리 MCP 클라이언트로 전 계층 통합 |
+
+통합 테스트는 HTTP 계층만 `respx`로 막고 나머지는 실제 코드 경로를 그대로 지나갑니다.
