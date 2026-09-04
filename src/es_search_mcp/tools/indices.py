@@ -9,6 +9,7 @@ from fastmcp import FastMCP
 
 from es_search_mcp.backend import SearchBackendClient
 from es_search_mcp.config import Settings
+from es_search_mcp.credentials import resolve_credentials
 from es_search_mcp.errors import tool_error_boundary
 from es_search_mcp.logging import get_logger
 from es_search_mcp.models import IndexList
@@ -37,6 +38,7 @@ def register(mcp: FastMCP, client: SearchBackendClient, settings: Settings) -> N
             backend reports it, `document_count`.
         """
         async with tool_error_boundary(mask_unexpected=settings.mask_error_details):
-            result = await client.list_indices()
+            credentials = resolve_credentials(settings)
+            result = await client.list_indices(credentials=credentials)
             logger.info("tool.list_indices.result", fields={"index_count": result.total})
             return result

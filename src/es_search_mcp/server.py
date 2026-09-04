@@ -30,9 +30,16 @@ Workflow:
 1. Call `list_indices` to see which indices exist and what each one contains.
 2. Call `retrieve_documents` with the index that matches the user's question.
 
+`retrieve_documents` supports four retrieval strategies through its `method`
+argument — `rrf` (default, hybrid), `bm25` (lexical), `knn` (vector) and `cc`
+(hybrid by score blending). Leave it at the default unless the question clearly
+favours exact terms or paraphrases.
+
 Every tool is read-only; nothing here modifies the corpus. Errors are returned
 with a stable `[CODE]` prefix — a code marked as retryable is worth one more
-attempt, any other code needs a changed request.
+attempt, any other code needs a changed request. `[MISSING_CREDENTIALS]` means
+the MCP client did not send the credential headers this server forwards to the
+backend; that is a client configuration problem, not something to retry.
 """
 
 

@@ -8,9 +8,45 @@ always receive the same normalised shape.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+
+class RetrieveMethod(StrEnum):
+    """Retrieval strategy, one per backend endpoint.
+
+    The backend exposes each strategy as its own endpoint
+    (``/retrieve-bm25``, ``/retrieve-knn``, ...); the value of this enum is the
+    suffix that selects it.
+    """
+
+    BM25 = "bm25"
+    KNN = "knn"
+    CC = "cc"
+    RRF = "rrf"
+
+
+#: One-line summaries used to build the tool description the model reads.
+RETRIEVE_METHOD_GUIDE: dict[RetrieveMethod, str] = {
+    RetrieveMethod.RRF: (
+        "Reciprocal Rank Fusion over lexical and vector results. The safe default: "
+        "use it unless there is a reason to prefer one signal over the other."
+    ),
+    RetrieveMethod.BM25: (
+        "Lexical keyword matching. Best for exact terms, product codes, error "
+        "strings, names and other rare tokens that must appear verbatim."
+    ),
+    RetrieveMethod.KNN: (
+        "Dense vector search. Best for paraphrased or conceptual questions whose "
+        "wording is unlikely to appear in the documents."
+    ),
+    RetrieveMethod.CC: (
+        "Convex combination of the lexical and vector scores. A hybrid like `rrf`, "
+        "but blending scores rather than ranks; try it when `rrf` ranks poorly."
+    ),
+}
 
 
 class IndexInfo(BaseModel):
@@ -86,11 +122,14 @@ class RetrieveResult(BaseModel):
 
     index: str = Field(description="Index the documents were read from.")
     query: str = Field(description="Query that produced these documents.")
+    method: RetrieveMethod = Field(description="Retrieval strategy that produced them.")
     total: int = Field(default=0, description="Number of documents returned.")
     documents: list[RetrievedDocument] = Field(default_factory=list)
 
     @classmethod
-    def from_payload(cls, payload: Any, *, index: str, query: str) -> RetrieveResult:
+    def from_payload(
+        cls, payload: Any, *, index: str, query: str, method: RetrieveMethod
+    ) -> RetrieveResult:
         """Build from either a bare list of hits or an object wrapping one.
 
         Accepted shapes::
@@ -100,7 +139,13 @@ class RetrieveResult(BaseModel):
         """
         raw = _unwrap_collection(payload, keys=("documents", "hits", "results", "items", "data"))
         documents = [RetrievedDocument.model_validate(entry) for entry in raw]
-        return cls(index=index, query=query, total=len(documents), documents=documents)
+        return cls(
+            index=index,
+            query=query,
+            method=method,
+            total=len(documents),
+            documents=documents,
+        )
 
 
 def _unwrap_collection(payload: Any, *, keys: tuple[str, ...]) -> list[Any]:

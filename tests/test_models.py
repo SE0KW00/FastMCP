@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from es_search_mcp.models import IndexList, RetrieveResult
+from es_search_mcp.models import IndexList, RetrieveMethod, RetrieveResult
 
 
 def test_index_aliases_are_accepted():
@@ -29,14 +29,22 @@ def test_document_aliases_are_accepted():
         {"hits": [{"_id": "1", "_score": 0.5, "body": "text", "meta": {"lang": "ko"}}]},
         index="faq",
         query="q",
+        method=RetrieveMethod.RRF,
     )
     document = result.documents[0]
     assert (document.id, document.score, document.content) == ("1", 0.5, "text")
     assert document.metadata == {"lang": "ko"}
 
 
+def test_the_method_is_carried_back_to_the_caller():
+    result = RetrieveResult.from_payload([], index="faq", query="q", method=RetrieveMethod.BM25)
+    assert result.method is RetrieveMethod.BM25
+
+
 def test_missing_optional_fields_get_defaults():
-    document = RetrieveResult.from_payload([{}], index="faq", query="q").documents[0]
+    document = RetrieveResult.from_payload(
+        [{}], index="faq", query="q", method=RetrieveMethod.RRF
+    ).documents[0]
     assert document.id is None
     assert document.score is None
     assert document.content == ""

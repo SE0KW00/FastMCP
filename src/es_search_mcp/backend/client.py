@@ -1,10 +1,13 @@
 """HTTP client for the backend API that fronts Elasticsearch.
 
-Every network concern lives here: authentication headers, timeouts, retries with
-exponential backoff, request correlation, and — most importantly — translating
-transport-level failures into the domain errors declared in
-:mod:`es_search_mcp.exceptions`. Callers above this layer never see an
-``httpx`` exception.
+Every network concern lives here: timeouts, retries with exponential backoff,
+request correlation, and — most importantly — translating transport-level
+failures into the domain errors declared in :mod:`es_search_mcp.exceptions`.
+Callers above this layer never see an ``httpx`` exception.
+
+Credentials are passed in per call rather than baked into the client, because
+they belong to the caller being served and change from request to request. The
+shared ``httpx`` client therefore carries no authentication of its own.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from typing import Any
 import httpx
 
 from es_search_mcp.config import Settings
+from es_search_mcp.credentials import BackendCredentials
 from es_search_mcp.exceptions import (
     BackendConnectionError,
     BackendError,
@@ -25,7 +29,7 @@ from es_search_mcp.exceptions import (
     error_for_status,
 )
 from es_search_mcp.logging import current_request_id, get_logger
-from es_search_mcp.models import IndexList, RetrieveResult
+from es_search_mcp.models import IndexList, RetrieveMethod, RetrieveResult
 
 logger = get_logger(__name__)
 
@@ -42,7 +46,7 @@ class SearchBackendClient:
         self._client = client or httpx.AsyncClient(
             base_url=settings.backend_base_url,
             timeout=settings.request_timeout,
-            headers=self._default_headers(settings),
+            headers={"Accept": "application/json"},
         )
 
     # -- lifecycle --------------------------------------------------------
@@ -63,48 +67,51 @@ class SearchBackendClient:
         await self.aclose()
 
     # -- public API -------------------------------------------------------
-    async def list_indices(self) -> IndexList:
+    async def list_indices(self, *, credentials: BackendCredentials) -> IndexList:
         """Fetch the indices the backend exposes, with their descriptions."""
-        payload = await self._request("GET", self._settings.backend_indices_path)
+        path = self._settings.backend_indices_path
+        payload = await self._request("GET", path, credentials=credentials)
         try:
             return IndexList.from_payload(payload)
         except ValueError as exc:
             raise BackendPayloadError(
                 "The backend returned an index list this server cannot parse.",
-                details={"path": self._settings.backend_indices_path, "reason": str(exc)},
+                details={"path": path, "reason": str(exc)},
             ) from exc
 
     async def retrieve(
         self,
         *,
+        credentials: BackendCredentials,
         index: str,
         query: str,
         top_k: int,
+        method: RetrieveMethod,
         filters: dict[str, Any] | None = None,
     ) -> RetrieveResult:
-        """Search ``index`` for ``query`` and return at most ``top_k`` documents."""
+        """Search ``index`` for ``query`` using ``method``'s dedicated endpoint.
+
+        Each retrieval strategy is a separate backend endpoint; the strategy
+        selects the path rather than travelling in the request body.
+        """
         body: dict[str, Any] = {"index": index, "query": query, "top_k": top_k}
         if filters:
             body["filters"] = filters
 
-        payload = await self._request("POST", self._settings.backend_retrieve_path, json=body)
+        path = self._settings.retrieve_path(method)
+        payload = await self._request("POST", path, credentials=credentials, json=body)
         try:
-            return RetrieveResult.from_payload(payload, index=index, query=query)
+            return RetrieveResult.from_payload(payload, index=index, query=query, method=method)
         except ValueError as exc:
             raise BackendPayloadError(
                 "The backend returned a search result this server cannot parse.",
-                details={"path": self._settings.backend_retrieve_path, "reason": str(exc)},
+                details={"path": path, "reason": str(exc)},
             ) from exc
 
     # -- internals --------------------------------------------------------
-    @staticmethod
-    def _default_headers(settings: Settings) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
-        if settings.backend_api_key is not None:
-            headers["Authorization"] = f"Bearer {settings.backend_api_key.get_secret_value()}"
-        return headers
-
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _request(
+        self, method: str, path: str, *, credentials: BackendCredentials, **kwargs: Any
+    ) -> Any:
         """Perform one backend call, retrying transient failures.
 
         Returns:
@@ -118,7 +125,9 @@ class SearchBackendClient:
 
         for attempt in range(1, attempts + 1):
             try:
-                return await self._attempt(method, path, attempt=attempt, **kwargs)
+                return await self._attempt(
+                    method, path, attempt=attempt, credentials=credentials, **kwargs
+                )
             except BackendError as exc:
                 last_error = exc
                 if not exc.retryable or attempt == attempts:
@@ -140,8 +149,17 @@ class SearchBackendClient:
         # Defensive: the loop either returns or raises, but keep the contract explicit.
         raise last_error or BackendError("The backend call failed for an unknown reason.")
 
-    async def _attempt(self, method: str, path: str, *, attempt: int, **kwargs: Any) -> Any:
+    async def _attempt(
+        self,
+        method: str,
+        path: str,
+        *,
+        attempt: int,
+        credentials: BackendCredentials,
+        **kwargs: Any,
+    ) -> Any:
         headers = dict(kwargs.pop("headers", {}) or {})
+        headers.update(credentials.as_headers(self._settings))
         request_id = current_request_id()
         if request_id:
             headers["X-Request-ID"] = request_id

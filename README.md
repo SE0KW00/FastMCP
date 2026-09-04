@@ -9,10 +9,15 @@
 | MCP 도구 | 백엔드 엔드포인트 | 하는 일 |
 | --- | --- | --- |
 | `list_indices` | `GET /indices` | 검색 가능한 인덱스 이름과 설명을 반환 |
-| `retrieve_documents` | `POST /retrieve` | 특정 인덱스에서 질의에 맞는 문서를 검색 |
+| `retrieve_documents` | `POST /retrieve-{method}` | 선택한 검색 전략으로 문서를 검색 |
+
+검색 전략은 백엔드에서 각각 별도의 엔드포인트(`/retrieve-bm25`, `/retrieve-knn`,
+`/retrieve-cc`, `/retrieve-rrf`)로 제공되며, MCP에서는 하나의 도구에 `method` 인자로
+노출합니다. 기본값은 `rrf`입니다.
 
 두 도구 모두 읽기 전용(`readOnlyHint`)이며, 구조화 로깅과 중앙집중식 에러 처리를
-거칩니다.
+거칩니다. **API 키는 서버에 저장되지 않고**, MCP 클라이언트가 요청 헤더로 보낸 값을
+그대로 백엔드로 전달합니다 (§4 참고).
 
 ---
 
@@ -29,6 +34,7 @@ MCP 클라이언트
 │       ├─ indices.py     list_indices          │
 │       └─ retrieve.py    retrieve_documents    │
 │            │                                  │
+│            ├─ credentials.py 호출자 키 추출    │
 │            ├─ errors.py     도구 에러 경계     │
 │            ▼                                  │
 │      backend/client.py  HTTP · 재시도 · 에러변환│
@@ -46,6 +52,7 @@ MCP 클라이언트
 | --- | --- |
 | `config.py` | 환경변수 기반 설정 (`ES_MCP_*`), 검증과 정규화 |
 | `logging.py` | 구조화 로깅, 호출 상관관계(correlation) 컨텍스트, 민감정보 마스킹 |
+| `credentials.py` | 요청 헤더에서 호출자의 키 2개를 읽어 백엔드로 전달 |
 | `exceptions.py` | 도메인 예외 계층과 안정적인 에러 코드 |
 | `errors.py` | 도메인 예외 → 클라이언트에게 보낼 `ToolError` 변환 경계 |
 | `models.py` | 백엔드 응답을 MCP 클라이언트용 스키마로 정규화 |
@@ -79,9 +86,19 @@ MCP 클라이언트
 * 봉투(envelope) 형태도 허용: `{"indices": [...]}`, `{"items": [...]}`,
   `{"data": [...]}`, `{"results": [...]}`
 
-### `POST /retrieve`
+### `POST /retrieve-{bm25,knn,cc,rrf}`
 
-요청 본문:
+검색 전략마다 별도의 엔드포인트가 있습니다. **전략은 경로로 선택되며 요청 본문에는
+들어가지 않습니다.**
+
+| `method` | 엔드포인트 | 성격 |
+| --- | --- | --- |
+| `rrf` *(기본값)* | `POST /retrieve-rrf` | 어휘 + 벡터 결과의 순위 융합 (RRF) |
+| `bm25` | `POST /retrieve-bm25` | 어휘 기반 키워드 매칭 |
+| `knn` | `POST /retrieve-knn` | 밀집 벡터 의미 검색 |
+| `cc` | `POST /retrieve-cc` | 어휘·벡터 점수의 볼록 결합 |
+
+네 엔드포인트의 요청/응답 형태는 동일합니다. 요청 본문:
 
 ```json
 { "index": "faq", "query": "환불 규정", "top_k": 5, "filters": { "lang": "ko" } }
@@ -105,9 +122,50 @@ MCP 클라이언트
 파싱할 수 없는 응답은 `BACKEND_INVALID_PAYLOAD` 에러가 됩니다. 백엔드가 위 형태에서
 많이 벗어난다면 `models.py`의 별칭만 손보면 됩니다.
 
+경로 규칙이 다르다면 `ES_MCP_BACKEND_RETRIEVE_PATH_TEMPLATE`만 바꾸면 됩니다
+(예: `/v2/search/{method}`). `{method}` 자리표시자가 없으면 기동 시 거부됩니다.
+
 ---
 
-## 3. 설정
+## 3. 인증: 호출자 키 전달
+
+이 서버는 **자체 자격증명을 갖지 않습니다.** 백엔드가 인증하는 대상은 이 서버가 아니라
+최종 사용자이므로, MCP 클라이언트가 매 요청 헤더로 키 2개를 보내고 서버는 그것을 그대로
+백엔드로 전달합니다.
+
+```
+MCP 클라이언트 ──[ Authorization, X-API-Key ]──▶ MCP 서버 ──(그대로)──▶ 백엔드 API
+```
+
+* 키는 **저장하지도, 캐시하지도, 기본값을 두지도 않습니다.** 서버가 보관하지 않는
+  자격증명은 서버가 유출할 수도 없습니다.
+* 요청마다 새로 읽으므로 동시에 들어온 호출자끼리 키가 섞이지 않습니다.
+* 도구의 **입력 인자가 아닙니다.** 키가 인자였다면 LLM 컨텍스트와 대화 로그에 그대로
+  남게 됩니다.
+* 로그에도 값이 남지 않습니다 (`SENSITIVE_KEYS` 마스킹).
+
+헤더 이름은 설정으로 바꿀 수 있습니다.
+
+| 환경변수 | 기본값 |
+| --- | --- |
+| `ES_MCP_AUTH_HEADER` | `authorization` |
+| `ES_MCP_API_KEY_HEADER` | `x-api-key` |
+
+둘 중 하나라도 없거나 비어 있으면 백엔드를 호출하지 않고 바로 실패합니다.
+
+```
+[MISSING_CREDENTIALS] This server forwards the caller's credentials to the search
+backend, but the request is missing: x-api-key. ...
+```
+
+> **stdio 트랜스포트에서는 동작하지 않습니다.** 헤더는 HTTP 요청에만 존재하므로,
+> `stdio`로 띄우면 모든 도구 호출이 `MISSING_CREDENTIALS`로 실패합니다. 그래서 기본
+> 트랜스포트가 `http`입니다. stdio를 써야 한다면 키를 환경변수로 받도록
+> `credentials.py`의 `resolve_credentials()`에 폴백을 추가하면 됩니다.
+
+---
+
+## 4. 설정
 
 모든 설정은 `ES_MCP_` 접두사를 가진 환경변수 또는 `.env` 파일로 주입합니다.
 전체 목록과 기본값은 [`.env.example`](.env.example)에 있습니다.
@@ -121,49 +179,62 @@ cp .env.example .env
 | 환경변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `ES_MCP_BACKEND_BASE_URL` | `http://localhost:8000` | 백엔드 API 주소 |
-| `ES_MCP_BACKEND_API_KEY` | *(없음)* | 있으면 `Authorization: Bearer ...`로 전송 |
+| `ES_MCP_BACKEND_RETRIEVE_PATH_TEMPLATE` | `/retrieve-{method}` | 검색 엔드포인트 경로 규칙 |
+| `ES_MCP_AUTH_HEADER` / `ES_MCP_API_KEY_HEADER` | `authorization` / `x-api-key` | 전달할 자격증명 헤더 이름 |
 | `ES_MCP_REQUEST_TIMEOUT` | `30.0` | 요청당 타임아웃(초) |
 | `ES_MCP_MAX_RETRIES` | `2` | 일시적 실패에 대한 재시도 횟수 |
 | `ES_MCP_DEFAULT_TOP_K` / `ES_MCP_MAX_TOP_K` | `5` / `50` | 검색 결과 개수 기본값과 상한 |
+| `ES_MCP_DEFAULT_RETRIEVE_METHOD` | `rrf` | `method`를 지정하지 않았을 때의 전략 |
 | `ES_MCP_LOG_LEVEL` / `ES_MCP_LOG_FORMAT` | `INFO` / `json` | 로그 레벨과 형식 |
 | `ES_MCP_MASK_ERROR_DETAILS` | `true` | 예기치 못한 에러의 내부 정보를 감출지 여부 |
-| `ES_MCP_TRANSPORT` | `stdio` | `stdio`, `http`, `sse` |
+| `ES_MCP_TRANSPORT` | `http` | `http`, `sse`, `stdio` (stdio는 자격증명 전달 불가) |
+
+API 키는 여기에 넣지 않습니다 — §3을 보세요.
 
 ---
 
-## 4. 실행
+## 5. 실행
 
 ```bash
-uv sync --all-groups     # 의존성 설치
-uv run es-search-mcp     # 또는: uv run python -m es_search_mcp
+uv sync --all-groups                                    # 의존성 설치
+ES_MCP_BACKEND_BASE_URL=https://search-api.internal \
+  uv run es-search-mcp                                  # http://127.0.0.1:8080/mcp/
 ```
 
-HTTP 트랜스포트로 띄우려면:
+### MCP 클라이언트 등록
 
-```bash
-ES_MCP_TRANSPORT=http ES_MCP_PORT=8080 uv run es-search-mcp
-```
-
-### MCP 클라이언트 등록 (stdio)
+자격증명은 클라이언트가 헤더로 보냅니다.
 
 ```json
 {
   "mcpServers": {
     "es-search": {
-      "command": "uv",
-      "args": ["--directory", "/절대/경로/FastMCP", "run", "es-search-mcp"],
-      "env": {
-        "ES_MCP_BACKEND_BASE_URL": "https://search-api.internal",
-        "ES_MCP_BACKEND_API_KEY": "..."
+      "url": "http://127.0.0.1:8080/mcp/",
+      "headers": {
+        "Authorization": "Bearer <첫 번째 키>",
+        "X-API-Key": "<두 번째 키>"
       }
     }
   }
 }
 ```
 
+### 호출 예시
+
+```bash
+curl -sS http://127.0.0.1:8080/mcp/ \
+  -H "Authorization: Bearer $KEY1" \
+  -H "X-API-Key: $KEY2" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"retrieve_documents",
+                 "arguments":{"index":"faq","query":"환불 규정","method":"bm25"}}}'
+```
+
 ---
 
-## 5. 커스텀 로깅
+## 6. 커스텀 로깅
 
 `logging.py`가 담당하며, 설계상 두 가지 제약을 지킵니다.
 
@@ -192,12 +263,14 @@ ES_MCP_TRANSPORT=http ES_MCP_PORT=8080 uv run es-search-mcp
 | `backend.request` / `backend.response` | 백엔드 호출 (`status_code`, `elapsed_ms`) |
 | `backend.retry` | 재시도 (`attempt`, `delay_seconds`, `error_code`) |
 | `tool.error` / `tool.unhandled_error` | 에러 경계가 잡은 실패의 상세 |
+| `tool.retrieve_documents.result` | 사용한 `method`, `top_k`, 결과 개수 |
 
 `request_id`는 백엔드로 나가는 요청의 `X-Request-ID` 헤더로도 전달되므로, MCP 서버
 로그와 백엔드 로그를 같은 키로 이어 붙일 수 있습니다.
 
-`api_key`, `authorization`, `password`, `secret`, `token` 필드는 출력 직전에
-`***`로 치환됩니다 (`SENSITIVE_KEYS`).
+`authorization`, `x-api-key`, `api_key`, `password`, `secret`, `token` 필드는 출력
+직전에 `***`로 치환됩니다 (`SENSITIVE_KEYS`). 호출자의 키는 애초에 도구 인자가 아니라
+헤더로 오기 때문에 `tool.call.start`의 `arguments`에도 들어가지 않습니다.
 
 사용법:
 
@@ -210,7 +283,7 @@ logger.info("backend.request", fields={"method": "GET", "path": "/indices"})
 
 ---
 
-## 6. 커스텀 에러 처리
+## 7. 커스텀 에러 처리
 
 ### 예외 계층
 
@@ -220,6 +293,7 @@ logger.info("backend.request", fields={"method": "GET", "path": "/indices"})
 | 에러 코드 | 언제 | 재시도 |
 | --- | --- | --- |
 | `INVALID_INPUT` | 도구 인자가 잘못됨 (백엔드 호출 전에 차단) | ✗ |
+| `MISSING_CREDENTIALS` | 호출자가 자격증명 헤더를 보내지 않음 | ✗ |
 | `CONFIGURATION_ERROR` | 서버 설정이 잘못됨 | ✗ |
 | `BACKEND_UNAVAILABLE` | 백엔드에 연결 불가 | ✓ |
 | `BACKEND_TIMEOUT` | 타임아웃 | ✓ |
@@ -252,9 +326,15 @@ middleware.py      도구 "바깥"에서 난 에러의 백스톱 + 호출 결과
 ```
 [BACKEND_TIMEOUT] The backend API did not respond within 30s. The request may succeed if retried.
 [INVALID_INPUT] `query` must not be empty. Provide the text to search for.
+[INVALID_INPUT] `method`: Input should be 'bm25', 'knn', 'cc' or 'rrf'
+[MISSING_CREDENTIALS] ... the request is missing: x-api-key. ...
 ```
 
 접두사 코드로 모델이 "다시 시도할 것"과 "인자를 고칠 것"을 구분할 수 있습니다.
+
+스키마 위반(잘못된 `method` 값 등)은 도구 본문이 실행되기도 전에 FastMCP가 잡습니다.
+이 경우도 마스킹하지 않고 어떤 인자가 무엇을 기대하는지 그대로 알려줍니다 — 내부 정보가
+아니라 호출자가 고쳐야 할 정보이기 때문입니다.
 
 ### 정보 노출 차단
 
@@ -270,7 +350,7 @@ middleware.py      도구 "바깥"에서 난 에러의 백스톱 + 호출 결과
 
 ---
 
-## 7. 개발
+## 8. 개발
 
 ```bash
 uv sync --all-groups
@@ -292,6 +372,10 @@ uv run mypy                # 타입 검사 (strict)
 * **도구 docstring은 모델이 읽는 문서입니다.** 언제 이 도구를 쓰는지, 다른 도구와
   어떤 순서로 쓰는지를 적습니다. 반환 스키마는 Pydantic 모델이 담당합니다.
 * **모든 도구 본문은 `tool_error_boundary()`로 감쌉니다.**
+* **자격증명은 요청마다 `resolve_credentials()`로 읽습니다.** 클라이언트나 모듈 전역에
+  보관하지 않습니다 — 보관하면 동시 호출자끼리 키가 섞입니다.
+* **검색 전략을 추가할 때는 `RetrieveMethod`에 값을 넣고 `RETRIEVE_METHOD_GUIDE`에
+  설명을 씁니다.** 설명은 도구 docstring에 자동으로 채워져 모델이 읽게 됩니다.
 * `tools/` 모듈은 `from __future__ import annotations`를 쓰지 않습니다. 도구 시그니처는
   등록 시점에 평가되어 MCP 입력 스키마가 되는데, 지연 평가된 문자열 애노테이션은
   클로저 변수(`settings`)를 해석하지 못합니다.
@@ -302,9 +386,12 @@ uv run mypy                # 타입 검사 (strict)
 | --- | --- |
 | `test_config.py` | 설정 정규화와 검증 |
 | `test_models.py` | 백엔드 응답 별칭·봉투 정규화 |
-| `test_backend_client.py` | 상태코드 → 예외 매핑, 재시도, 헤더 전파 (`respx`) |
+| `test_backend_client.py` | 상태코드 → 예외 매핑, 재시도, method별 엔드포인트, 헤더 전파 (`respx`) |
+| `test_credentials.py` | 헤더 추출, 누락 처리, 헤더 이름 설정 |
 | `test_errors.py` | 에러 경계의 변환과 마스킹 |
 | `test_logging.py` | 포맷터, 컨텍스트 바인딩, 마스킹, stderr 보장 |
 | `test_server_tools.py` | 인메모리 MCP 클라이언트로 전 계층 통합 |
 
-통합 테스트는 HTTP 계층만 `respx`로 막고 나머지는 실제 코드 경로를 그대로 지나갑니다.
+통합 테스트는 실제 ASGI 앱을 인프로세스로 띄워(`httpx2.ASGITransport`, 소켓 없음)
+자격증명 헤더까지 실제 경로로 지나갑니다. MCP 클라이언트는 `httpx2`를, 백엔드 클라이언트는
+`httpx`를 쓰기 때문에 `respx`는 백엔드 호출만 정확히 가로챕니다.

@@ -14,6 +14,9 @@ Inside the boundary:
 * a :class:`~es_search_mcp.exceptions.SearchMCPError` keeps its stable code and
   its actionable message — the model can tell "retry this" apart from "change
   your arguments";
+* an argument-validation failure raised by FastMCP *before* the tool body runs
+  is reported as ``INVALID_INPUT`` with the offending parameter and the accepted
+  values, because that is exactly what the caller needs to fix the call;
 * anything else is logged with a full traceback and reported as a single
   generic message, so stack traces, URLs and internal identifiers never reach
   the client.
@@ -25,6 +28,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as ArgumentValidationError
+from pydantic import ValidationError as PydanticValidationError
 
 from es_search_mcp.exceptions import SearchMCPError
 from es_search_mcp.logging import get_logger
@@ -38,12 +43,29 @@ GENERIC_ERROR_MESSAGE = (
 )
 
 
+def _argument_validation_detail(exc: ArgumentValidationError) -> str:
+    """Summarise a schema violation in terms the caller can act on."""
+    cause = exc.__cause__
+    if not isinstance(cause, PydanticValidationError):
+        return str(exc)
+    problems = [
+        f"`{'.'.join(str(part) for part in error['loc']) or 'argument'}`: {error['msg']}"
+        for error in cause.errors(include_url=False)
+    ]
+    return "; ".join(problems) or str(exc)
+
+
 def to_tool_error(exc: Exception, *, mask_unexpected: bool = True) -> ToolError:
     """Translate an exception into the ``ToolError`` a client should receive."""
     if isinstance(exc, ToolError):
         return exc
     if isinstance(exc, SearchMCPError):
         return ToolError(exc.client_message())
+    if isinstance(exc, ArgumentValidationError):
+        # Raised by FastMCP against the tool's own schema, before the body runs.
+        # It names the parameter and the accepted values and exposes nothing
+        # internal, so it is reported in full even when masking is on.
+        return ToolError(f"[INVALID_INPUT] {_argument_validation_detail(exc)}")
     if mask_unexpected:
         return ToolError(GENERIC_ERROR_MESSAGE)
     return ToolError(f"[INTERNAL_ERROR] {exc}")

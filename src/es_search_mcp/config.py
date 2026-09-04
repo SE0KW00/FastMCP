@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from es_search_mcp.models import RetrieveMethod
 
 LogFormat = Literal["json", "text"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -35,17 +37,29 @@ class Settings(BaseSettings):
         default="http://localhost:8000",
         description="Base URL of the backend API that talks to Elasticsearch.",
     )
-    backend_api_key: SecretStr | None = Field(
-        default=None,
-        description="Optional bearer token sent to the backend API.",
-    )
     backend_indices_path: str = Field(
         default="/indices",
         description="Path of the endpoint returning index names and descriptions.",
     )
-    backend_retrieve_path: str = Field(
-        default="/retrieve",
-        description="Path of the endpoint returning documents for a query.",
+    backend_retrieve_path_template: str = Field(
+        default="/retrieve-{method}",
+        description=(
+            "Path template of the retrieval endpoints. `{method}` is replaced by the "
+            "retrieval strategy, giving /retrieve-bm25, /retrieve-knn, /retrieve-cc "
+            "and /retrieve-rrf."
+        ),
+    )
+
+    # --- Caller credentials ----------------------------------------------
+    # The two keys are supplied per request by the MCP client and forwarded to
+    # the backend unchanged; this server never stores or defaults them.
+    auth_header: str = Field(
+        default="authorization",
+        description="Incoming header carrying the first key, forwarded under the same name.",
+    )
+    api_key_header: str = Field(
+        default="x-api-key",
+        description="Incoming header carrying the second key, forwarded under the same name.",
     )
 
     # --- HTTP behaviour --------------------------------------------------
@@ -62,6 +76,10 @@ class Settings(BaseSettings):
     # --- Search defaults -------------------------------------------------
     default_top_k: int = Field(default=5, ge=1, description="Default number of documents.")
     max_top_k: int = Field(default=50, ge=1, description="Upper bound accepted for top_k.")
+    default_retrieve_method: RetrieveMethod = Field(
+        default=RetrieveMethod.RRF,
+        description="Retrieval strategy used when the caller does not name one.",
+    )
 
     # --- Observability ---------------------------------------------------
     log_level: LogLevel = Field(default="INFO", description="Root log level for the server.")
@@ -74,7 +92,13 @@ class Settings(BaseSettings):
     )
 
     # --- Transport -------------------------------------------------------
-    transport: Transport = Field(default="stdio", description="MCP transport to serve on.")
+    transport: Transport = Field(
+        default="http",
+        description=(
+            "MCP transport to serve on. Caller credentials arrive as HTTP headers, so "
+            "`stdio` cannot supply them and tool calls will fail with MISSING_CREDENTIALS."
+        ),
+    )
     host: str = Field(default="127.0.0.1", description="Bind host for HTTP transports.")
     port: int = Field(default=8080, ge=1, le=65535, description="Bind port for HTTP transports.")
 
@@ -83,10 +107,29 @@ class Settings(BaseSettings):
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
 
-    @field_validator("backend_indices_path", "backend_retrieve_path")
+    @field_validator("backend_indices_path", "backend_retrieve_path_template")
     @classmethod
     def _ensure_leading_slash(cls, value: str) -> str:
         return value if value.startswith("/") else f"/{value}"
+
+    @field_validator("backend_retrieve_path_template")
+    @classmethod
+    def _require_method_placeholder(cls, value: str) -> str:
+        if "{method}" not in value:
+            raise ValueError("backend_retrieve_path_template must contain '{method}'")
+        return value
+
+    @field_validator("auth_header", "api_key_header")
+    @classmethod
+    def _normalise_header_name(cls, value: str) -> str:
+        normalised = value.strip().lower()
+        if not normalised:
+            raise ValueError("header names must not be empty")
+        return normalised
+
+    def retrieve_path(self, method: RetrieveMethod) -> str:
+        """Return the backend path serving ``method``."""
+        return self.backend_retrieve_path_template.format(method=method.value)
 
     def model_post_init(self, __context: object) -> None:
         if self.default_top_k > self.max_top_k:

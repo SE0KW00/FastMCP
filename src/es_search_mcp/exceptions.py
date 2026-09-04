@@ -74,6 +74,12 @@ class InvalidInputError(SearchMCPError):
     code = "INVALID_INPUT"
 
 
+class MissingCredentialsError(SearchMCPError):
+    """The caller did not supply the credential headers the backend requires."""
+
+    code = "MISSING_CREDENTIALS"
+
+
 class BackendError(SearchMCPError):
     """Base class for failures that originate in the backend API."""
 
