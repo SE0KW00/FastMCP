@@ -36,7 +36,13 @@ SENSITIVE_KEYS = frozenset({"api_key", "apikey", "authorization", "password", "s
 _REDACTED = "***"
 
 #: Attributes present on every ``LogRecord``; anything else was added by us.
-_RESERVED_RECORD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
+#: ``message`` and ``asctime`` are added by ``Formatter.format`` itself, and
+#: ``taskName`` by the asyncio integration — none of them are our fields.
+_RESERVED_RECORD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {
+    "message",
+    "asctime",
+    "taskName",
+}
 
 _request_id: ContextVar[str | None] = ContextVar("es_mcp_request_id", default=None)
 _tool_name: ContextVar[str | None] = ContextVar("es_mcp_tool_name", default=None)
@@ -127,7 +133,7 @@ def _record_fields(record: logging.LogRecord) -> dict[str, Any]:
     """Collect the structured fields carried by a record."""
     fields: dict[str, Any] = {}
     for key, value in record.__dict__.items():
-        if key in _RESERVED_RECORD_ATTRS or key.startswith("_") or key == "taskName":
+        if key in _RESERVED_RECORD_ATTRS or key.startswith("_"):
             continue
         if key == "fields" and isinstance(value, dict):
             fields.update(value)

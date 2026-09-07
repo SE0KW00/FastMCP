@@ -41,6 +41,8 @@ ignore = ["ANN401"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ANN", "S101"]
+# Local dev helpers: printing to the console is the point.
+"scripts/*" = ["T20"]
 
 [tool.mypy]
 python_version = "3.11"

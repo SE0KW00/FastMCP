@@ -60,6 +60,7 @@ MCP 클라이언트
 | `middleware.py` | 도구 호출 단위 로깅, 도구 바깥에서 난 에러의 백스톱 |
 | `tools/` | MCP 도구 정의 (입력 검증 + 백엔드 호출 + 결과 로깅) |
 | `server.py` | 설정·클라이언트·미들웨어·도구를 조립하는 유일한 진입점 |
+| `scripts/fake_backend.py` | 로컬 확인용 가짜 백엔드 (표준 라이브러리만 사용) |
 
 **의존성은 명시적으로 주입합니다.** 도구는 `register(mcp, client, settings)` 형태로
 등록되며 전역 상태를 참조하지 않습니다. 덕분에 테스트에서 스텁 클라이언트를 그대로
@@ -195,10 +196,69 @@ API 키는 여기에 넣지 않습니다 — §3을 보세요.
 
 ## 5. 실행
 
+### 설치
+
+`uv`를 쓰는 경우:
+
 ```bash
-uv sync --all-groups                                    # 의존성 설치
+uv sync --all-groups
+```
+
+**표준 `python` / `pip`만 쓰는 경우** (uv 불필요):
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e .
+```
+
+`pip install -e .`는 런타임 의존성만 설치합니다. 테스트·린트까지 돌리려면 개발 도구를
+따로 넣으세요 (pip 25.1 이상이면 `pip install --group dev`로도 됩니다).
+
+```bash
+pip install pytest pytest-asyncio respx ruff mypy
+```
+
+### 기동
+
+```bash
 ES_MCP_BACKEND_BASE_URL=https://search-api.internal \
-  uv run es-search-mcp                                  # http://127.0.0.1:8080/mcp/
+ES_MCP_TRANSPORT=http ES_MCP_HOST=127.0.0.1 ES_MCP_PORT=8080 \
+  python -m es_search_mcp
+```
+
+설치하면 콘솔 스크립트도 생기므로 `es-search-mcp`로도 동일하게 뜹니다
+(`uv` 사용 시에는 `uv run es-search-mcp`).
+
+환경변수를 매번 나열하기 번거로우면 `.env`에 넣으면 됩니다.
+
+```bash
+cp .env.example .env    # 값을 채운 뒤
+python -m es_search_mcp
+```
+
+기동에 성공하면 엔드포인트는 **`http://127.0.0.1:8080/mcp/`** 입니다.
+
+### 로컬에서 통째로 굴려보기
+
+백엔드가 아직 없어도 동봉된 가짜 백엔드로 전 구간을 확인할 수 있습니다. 표준
+라이브러리만 쓰므로 추가 설치가 필요 없습니다.
+
+```bash
+# 터미널 1 — 가짜 백엔드 (인덱스 목록 + 4개 retrieve 엔드포인트)
+python scripts/fake_backend.py 9000
+
+# 터미널 2 — MCP 서버
+ES_MCP_BACKEND_BASE_URL=http://127.0.0.1:9000 \
+ES_MCP_TRANSPORT=http ES_MCP_PORT=8080 ES_MCP_LOG_FORMAT=text \
+  python -m es_search_mcp
+```
+
+가짜 백엔드는 받은 자격증명 헤더를 그대로 찍어주므로, 키가 제대로 전달되는지 눈으로
+확인할 수 있습니다.
+
+```
+[backend] POST /retrieve-bm25  Authorization='Bearer MY-TOKEN'  X-API-Key='MY-KEY'
 ```
 
 ### MCP 클라이언트 등록
@@ -219,17 +279,63 @@ ES_MCP_BACKEND_BASE_URL=https://search-api.internal \
 }
 ```
 
-### 호출 예시
+### 호출 예시 (Python)
+
+가장 간단한 확인 방법입니다.
+
+```python
+import asyncio
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+
+transport = StreamableHttpTransport(
+    "http://127.0.0.1:8080/mcp/",
+    headers={"Authorization": "Bearer MY-TOKEN", "X-API-Key": "MY-KEY"},
+)
+
+
+async def main():
+    async with Client(transport) as client:
+        print([t.name for t in await client.list_tools()])
+        result = await client.call_tool(
+            "retrieve_documents",
+            {"index": "faq", "query": "환불 규정", "method": "bm25", "top_k": 2},
+        )
+        print(result.structured_content)
+
+
+asyncio.run(main())
+```
+
+### 호출 예시 (curl)
+
+MCP Streamable HTTP는 **세션**을 씁니다. `initialize` 응답의 `mcp-session-id`를 받아
+이후 요청에 붙여야 하고, 그 사이에 `notifications/initialized`를 한 번 보내야 합니다.
+(경로는 `/mcp` — `/mcp/`로 보내면 307로 리다이렉트되므로 `curl -L`이 필요합니다.)
 
 ```bash
-curl -sS http://127.0.0.1:8080/mcp/ \
-  -H "Authorization: Bearer $KEY1" \
-  -H "X-API-Key: $KEY2" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"retrieve_documents",
-                 "arguments":{"index":"faq","query":"환불 규정","method":"bm25"}}}'
+AUTH=(-H "Authorization: Bearer MY-TOKEN" -H "X-API-Key: MY-KEY"
+      -H "Content-Type: application/json"
+      -H "Accept: application/json, text/event-stream")
+
+# 1) 세션 열기 — 응답 헤더에서 세션 id를 꺼낸다
+SID=$(curl -sS -D - -o /dev/null -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+       "protocolVersion":"2025-06-18","capabilities":{},
+       "clientInfo":{"name":"curl","version":"1"}}}' \
+  | tr -d '\r' | sed -n 's/^mcp-session-id: //Ip')
+
+# 2) 초기화 완료 통지
+curl -sS -o /dev/null -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
+  -H "mcp-session-id: $SID" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# 3) 도구 호출 (응답은 SSE이므로 `data:` 줄만 추린다)
+curl -sS -N -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
+  -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+       "name":"retrieve_documents",
+       "arguments":{"index":"faq","query":"환불 규정","method":"bm25"}}}' \
+  | sed -n 's/^data: //p'
 ```
 
 ---
@@ -352,6 +458,8 @@ middleware.py      도구 "바깥"에서 난 에러의 백스톱 + 호출 결과
 
 ## 8. 개발
 
+`uv`를 쓰는 경우:
+
 ```bash
 uv sync --all-groups
 
@@ -359,6 +467,17 @@ uv run pytest              # 테스트
 uv run ruff check .        # 린트
 uv run ruff format .       # 포매팅
 uv run mypy                # 타입 검사 (strict)
+```
+
+표준 `python` / `pip`만 쓰는 경우 (§5의 venv를 활성화한 상태에서):
+
+```bash
+pip install -e . && pip install pytest pytest-asyncio respx ruff mypy
+
+pytest
+ruff check .
+ruff format .
+mypy
 ```
 
 ### 규칙

@@ -38,6 +38,13 @@ def test_text_formatter_appends_fields():
     assert "index=faq" in TextFormatter().format(_record(index="faq"))
 
 
+def test_text_formatter_does_not_echo_formatter_internals():
+    """`Formatter.format` adds `message` and `asctime` to the record itself."""
+    rendered = TextFormatter().format(_record(index="faq"))
+    assert "message=" not in rendered
+    assert "asctime=" not in rendered
+
+
 def test_redaction_covers_nested_structures():
     cleaned = redact({"api_key": "x", "nested": [{"token": "y", "keep": "z"}]})
     assert cleaned == {"api_key": "***", "nested": [{"token": "***", "keep": "z"}]}
