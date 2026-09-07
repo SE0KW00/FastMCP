@@ -36,6 +36,11 @@ logger = get_logger(__name__)
 #: How much of an error body is worth keeping for diagnostics.
 _MAX_ERROR_BODY = 500
 
+#: Body field carrying the indices to search. The backend spells it with a
+#: capital I and expects the indices as one comma-joined string, not a list —
+#: both are deliberate, so do not "correct" either.
+INDEX_FIELD = "Index_name"
+
 
 class SearchBackendClient:
     """Async client for the two endpoints this server exposes as tools."""
@@ -83,25 +88,30 @@ class SearchBackendClient:
         self,
         *,
         credentials: BackendCredentials,
-        index: str,
+        indices: list[str],
         query: str,
         top_k: int,
         method: RetrieveMethod,
-        filters: dict[str, Any] | None = None,
+        permission_groups: list[str],
     ) -> RetrieveResult:
-        """Search ``index`` for ``query`` using ``method``'s dedicated endpoint.
+        """Search ``indices`` for ``query`` using ``method``'s dedicated endpoint.
 
-        Each retrieval strategy is a separate backend endpoint; the strategy
-        selects the path rather than travelling in the request body.
+        Each retrieval strategy is a separate backend endpoint, so the strategy
+        selects the path rather than travelling in the request body. The indices
+        do travel in the body, but as one comma-joined string rather than a list
+        — see :data:`INDEX_FIELD`.
         """
-        body: dict[str, Any] = {"index": index, "query": query, "top_k": top_k}
-        if filters:
-            body["filters"] = filters
+        body: dict[str, Any] = {
+            INDEX_FIELD: ",".join(indices),
+            "query": query,
+            "top_k": top_k,
+            "permission_groups": permission_groups,
+        }
 
         path = self._settings.retrieve_path(method)
         payload = await self._request("POST", path, credentials=credentials, json=body)
         try:
-            return RetrieveResult.from_payload(payload, index=index, query=query, method=method)
+            return RetrieveResult.from_payload(payload, indices=indices, query=query, method=method)
         except ValueError as exc:
             raise BackendPayloadError(
                 "The backend returned a search result this server cannot parse.",

@@ -27,7 +27,7 @@ def test_unknown_shapes_are_rejected():
 def test_document_aliases_are_accepted():
     result = RetrieveResult.from_payload(
         {"hits": [{"_id": "1", "_score": 0.5, "body": "text", "meta": {"lang": "ko"}}]},
-        index="faq",
+        indices=["faq"],
         query="q",
         method=RetrieveMethod.RRF,
     )
@@ -36,14 +36,21 @@ def test_document_aliases_are_accepted():
     assert document.metadata == {"lang": "ko"}
 
 
+def test_all_requested_indices_are_carried_back_to_the_caller():
+    result = RetrieveResult.from_payload(
+        [], indices=["faq", "manuals"], query="q", method=RetrieveMethod.RRF
+    )
+    assert result.indices == ["faq", "manuals"]
+
+
 def test_the_method_is_carried_back_to_the_caller():
-    result = RetrieveResult.from_payload([], index="faq", query="q", method=RetrieveMethod.BM25)
+    result = RetrieveResult.from_payload([], indices=["faq"], query="q", method=RetrieveMethod.BM25)
     assert result.method is RetrieveMethod.BM25
 
 
 def test_missing_optional_fields_get_defaults():
     document = RetrieveResult.from_payload(
-        [{}], index="faq", query="q", method=RetrieveMethod.RRF
+        [{}], indices=["faq"], query="q", method=RetrieveMethod.RRF
     ).documents[0]
     assert document.id is None
     assert document.score is None

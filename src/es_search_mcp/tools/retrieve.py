@@ -1,4 +1,4 @@
-"""``retrieve_documents`` — search one index with a chosen retrieval strategy.
+"""``retrieve`` — search one or more indices with a chosen retrieval strategy.
 
 The backend exposes each strategy as its own endpoint (``/retrieve-bm25``,
 ``/retrieve-knn``, ``/retrieve-cc``, ``/retrieve-rrf``). They are presented here
@@ -12,7 +12,7 @@ care gets the sensible default (`rrf`) without having to choose at all.
 # and the annotations below close over `settings`, which a deferred (string)
 # annotation could not resolve.
 
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastmcp import FastMCP
 from pydantic import Field
@@ -44,10 +44,15 @@ def _method_documentation(settings: Settings) -> str:
 def register(mcp: FastMCP, client: SearchBackendClient, settings: Settings) -> None:
     """Register the document-retrieval tool on ``mcp``."""
 
-    async def retrieve_documents(
-        index: Annotated[
-            str,
-            Field(description="Index to search. Must be a name returned by `list_indices`."),
+    async def retrieve(
+        indices: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "Indices to search. Every name must come from `get_indices`. "
+                    "Pass several to search them together, or one for a single index."
+                ),
+            ),
         ],
         query: Annotated[
             str,
@@ -74,22 +79,27 @@ def register(mcp: FastMCP, client: SearchBackendClient, settings: Settings) -> N
                 ),
             ),
         ] = None,
-        filters: Annotated[
-            dict[str, Any] | None,
+        permission_groups: Annotated[
+            list[str] | None,
             Field(
                 default=None,
                 description=(
-                    "Optional field/value pairs used to narrow the search, "
-                    'e.g. {"category": "billing"}.'
+                    "Access groups used to filter the searchable documents. Leave it "
+                    "out unless the caller has been given specific groups; it then "
+                    f"defaults to {settings.default_permission_groups}."
                 ),
             ),
         ] = None,
     ) -> RetrieveResult:
-        """Search an Elasticsearch index and return the most relevant documents.
+        """Search Elasticsearch indices and return the most relevant documents.
 
-        Use `list_indices` first to find out which index fits the question, then
-        call this tool with that index name. Prefer a specific query over a broad
-        one, and raise `top_k` only when more evidence is genuinely needed.
+        Use `get_indices` first to find out which indices fit the question, then
+        call this tool with those names. Prefer a specific query over a broad one,
+        and raise `top_k` only when more evidence is genuinely needed.
+
+        Searching several indices at once is worthwhile when a question spans
+        them; when one index clearly holds the answer, searching only that one
+        gives cleaner results.
 
         Choosing `method`:
 
@@ -105,26 +115,27 @@ def register(mcp: FastMCP, client: SearchBackendClient, settings: Settings) -> N
         """
         async with tool_error_boundary(mask_unexpected=settings.mask_error_details):
             credentials = resolve_credentials(settings)
-            normalised_index = _validate_index(index)
+            normalised_indices = _validate_indices(indices)
             normalised_query = _validate_query(query)
             effective_top_k = _resolve_top_k(top_k, settings)
+            effective_groups = _resolve_permission_groups(permission_groups, settings)
 
             result = await client.retrieve(
                 credentials=credentials,
-                index=normalised_index,
+                indices=normalised_indices,
                 query=normalised_query,
                 top_k=effective_top_k,
                 method=method,
-                filters=filters,
+                permission_groups=effective_groups,
             )
             logger.info(
-                "tool.retrieve_documents.result",
+                "tool.retrieve.result",
                 fields={
-                    "index": normalised_index,
+                    "indices": normalised_indices,
                     "method": method.value,
                     "top_k": effective_top_k,
                     "document_count": result.total,
-                    "has_filters": bool(filters),
+                    "permission_groups": effective_groups,
                 },
             )
             return result
@@ -132,28 +143,37 @@ def register(mcp: FastMCP, client: SearchBackendClient, settings: Settings) -> N
     # The strategy guidance is data (`RETRIEVE_METHOD_GUIDE`), so it is substituted
     # into the docstring the model reads rather than duplicated as a literal. A
     # docstring cannot be an f-string, hence the fill-in before registration.
-    assert retrieve_documents.__doc__ is not None
-    retrieve_documents.__doc__ = retrieve_documents.__doc__.format(
-        method_documentation=_method_documentation(settings)
-    )
+    assert retrieve.__doc__ is not None
+    retrieve.__doc__ = retrieve.__doc__.format(method_documentation=_method_documentation(settings))
 
     mcp.tool(
-        name="retrieve_documents",
-        title="Retrieve documents from an index",
+        name="retrieve",
+        title="Retrieve documents from one or more indices",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"search", "retrieval"},
-    )(retrieve_documents)
+    )(retrieve)
 
 
-def _validate_index(index: str) -> str:
-    """Reject an empty index name before spending a network round-trip on it."""
-    normalised = index.strip()
-    if not normalised:
+def _validate_indices(indices: list[str]) -> list[str]:
+    """Normalise the requested indices, rejecting an empty selection.
+
+    Blank entries are dropped and duplicates collapsed — both would otherwise
+    survive into the comma-joined string the backend receives, where an empty
+    segment or a repeat is at best noise.
+    """
+    seen: dict[str, None] = {}
+    for entry in indices:
+        name = entry.strip()
+        if name:
+            seen.setdefault(name, None)
+
+    if not seen:
         raise InvalidInputError(
-            "`index` must not be empty. Call `list_indices` to see the available indices.",
-            details={"argument": "index"},
+            "`indices` must name at least one index. Call `get_indices` to see "
+            "the available indices.",
+            details={"argument": "indices"},
         )
-    return normalised
+    return list(seen)
 
 
 def _validate_query(query: str) -> str:
@@ -187,3 +207,14 @@ def _resolve_top_k(top_k: int | None, settings: Settings) -> int:
             details={"argument": "top_k", "value": top_k, "max": settings.max_top_k},
         )
     return top_k
+
+
+def _resolve_permission_groups(groups: list[str] | None, settings: Settings) -> list[str]:
+    """Fall back to the configured default groups when the caller names none.
+
+    An explicit empty list is treated as "not supplied" rather than "no groups":
+    the backend uses these to decide what the caller may see, so an accidentally
+    empty list must not silently widen or narrow that decision.
+    """
+    named = [group.strip() for group in groups or [] if group.strip()]
+    return named or list(settings.default_permission_groups)

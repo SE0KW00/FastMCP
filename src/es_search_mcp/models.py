@@ -56,7 +56,7 @@ class IndexInfo(BaseModel):
 
     name: str = Field(
         validation_alias=AliasChoices("name", "index", "index_name"),
-        description="Index name to pass to the retrieve tool.",
+        description="Index name to pass to the `retrieve` tool.",
     )
     description: str = Field(
         default="",
@@ -71,7 +71,7 @@ class IndexInfo(BaseModel):
 
 
 class IndexList(BaseModel):
-    """Result of the ``list_indices`` tool."""
+    """Result of the ``get_indices`` tool."""
 
     indices: list[IndexInfo] = Field(default_factory=list)
     total: int = Field(default=0, description="Number of indices returned.")
@@ -118,9 +118,9 @@ class RetrievedDocument(BaseModel):
 
 
 class RetrieveResult(BaseModel):
-    """Result of the ``retrieve_documents`` tool."""
+    """Result of the ``retrieve`` tool."""
 
-    index: str = Field(description="Index the documents were read from.")
+    indices: list[str] = Field(description="Indices the documents were read from.")
     query: str = Field(description="Query that produced these documents.")
     method: RetrieveMethod = Field(description="Retrieval strategy that produced them.")
     total: int = Field(default=0, description="Number of documents returned.")
@@ -128,7 +128,7 @@ class RetrieveResult(BaseModel):
 
     @classmethod
     def from_payload(
-        cls, payload: Any, *, index: str, query: str, method: RetrieveMethod
+        cls, payload: Any, *, indices: list[str], query: str, method: RetrieveMethod
     ) -> RetrieveResult:
         """Build from either a bare list of hits or an object wrapping one.
 
@@ -140,7 +140,7 @@ class RetrieveResult(BaseModel):
         raw = _unwrap_collection(payload, keys=("documents", "hits", "results", "items", "data"))
         documents = [RetrievedDocument.model_validate(entry) for entry in raw]
         return cls(
-            index=index,
+            indices=list(indices),
             query=query,
             method=method,
             total=len(documents),

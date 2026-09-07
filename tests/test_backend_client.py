@@ -9,6 +9,7 @@ import pytest
 import respx
 
 from es_search_mcp.backend import SearchBackendClient
+from es_search_mcp.backend.client import INDEX_FIELD
 from es_search_mcp.exceptions import (
     BackendAuthError,
     BackendNotFoundError,
@@ -68,16 +69,22 @@ async def test_retrieve_sends_the_expected_body(client, credentials):
     )
     result = await client.retrieve(
         credentials=credentials,
-        index="faq",
+        indices=["faq", "manuals"],
         query="refund",
         top_k=3,
         method=RetrieveMethod.RRF,
-        filters={"lang": "ko"},
+        permission_groups=["rag-public", "billing"],
     )
 
     sent = json.loads(route.calls.last.request.read())
-    assert sent == {"index": "faq", "query": "refund", "top_k": 3, "filters": {"lang": "ko"}}
-    assert result.index == "faq"
+    assert sent == {
+        # Several indices become ONE comma-joined string under a capital-I key.
+        "Index_name": "faq,manuals",
+        "query": "refund",
+        "top_k": 3,
+        "permission_groups": ["rag-public", "billing"],
+    }
+    assert result.indices == ["faq", "manuals"]
     assert result.query == "refund"
     assert result.method is RetrieveMethod.RRF
     assert result.total == 1
@@ -94,7 +101,12 @@ async def test_each_method_uses_its_own_endpoint(client, credentials, method):
         return_value=httpx.Response(200, json=[])
     )
     result = await client.retrieve(
-        credentials=credentials, index="faq", query="q", top_k=1, method=method
+        credentials=credentials,
+        indices=["faq"],
+        query="q",
+        top_k=1,
+        method=method,
+        permission_groups=["rag-public"],
     )
 
     assert route.call_count == 1
@@ -102,13 +114,45 @@ async def test_each_method_uses_its_own_endpoint(client, credentials, method):
     assert result.method is method
 
 
+@pytest.mark.parametrize(
+    ("indices", "expected"),
+    [
+        pytest.param(["faq"], "faq", id="single"),
+        pytest.param(["faq", "manuals"], "faq,manuals", id="several"),
+        pytest.param(["a", "b", "c"], "a,b,c", id="many"),
+    ],
+)
 @respx.mock
-async def test_retrieve_omits_absent_filters(client, credentials):
+async def test_indices_are_sent_as_one_comma_joined_string(client, credentials, indices, expected):
     route = respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
     await client.retrieve(
-        credentials=credentials, index="faq", query="refund", top_k=1, method=RetrieveMethod.RRF
+        credentials=credentials,
+        indices=indices,
+        query="q",
+        top_k=1,
+        method=RetrieveMethod.RRF,
+        permission_groups=["rag-public"],
     )
-    assert b"filters" not in route.calls.last.request.read()
+
+    sent = json.loads(route.calls.last.request.read())
+    assert sent[INDEX_FIELD] == expected
+    assert isinstance(sent[INDEX_FIELD], str)
+
+
+@respx.mock
+async def test_permission_groups_are_sent_verbatim_as_a_list(client, credentials):
+    route = respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
+    await client.retrieve(
+        credentials=credentials,
+        indices=["faq"],
+        query="q",
+        top_k=1,
+        method=RetrieveMethod.RRF,
+        permission_groups=["rag-public", "rag-internal"],
+    )
+
+    sent = json.loads(route.calls.last.request.read())
+    assert sent["permission_groups"] == ["rag-public", "rag-internal"]
 
 
 @respx.mock
@@ -119,7 +163,12 @@ async def test_retrieve_reads_nested_elasticsearch_hits(client, credentials):
         )
     )
     result = await client.retrieve(
-        credentials=credentials, index="faq", query="q", top_k=1, method=RetrieveMethod.KNN
+        credentials=credentials,
+        indices=["faq"],
+        query="q",
+        top_k=1,
+        method=RetrieveMethod.KNN,
+        permission_groups=["rag-public"],
     )
     assert result.documents[0].metadata == {"title": "t"}
 
@@ -221,6 +270,6 @@ async def test_the_shared_client_carries_no_credentials_of_its_own(settings):
 @respx.mock
 async def test_request_id_is_propagated_to_the_backend(client, credentials):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(200, json=[]))
-    with bind_call_context(request_id="abc123", tool_name="list_indices"):
+    with bind_call_context(request_id="abc123", tool_name="get_indices"):
         await client.list_indices(credentials=credentials)
     assert respx.calls.last.request.headers["x-request-id"] == "abc123"

@@ -25,17 +25,19 @@ def _payload(result):
 
 async def test_tools_are_advertised(mcp_client):
     names = {tool.name for tool in await mcp_client.list_tools()}
-    assert names == {"list_indices", "retrieve_documents"}
+    assert names == {"get_indices", "retrieve"}
 
 
 async def test_tool_schema_documents_the_retrieval_methods(mcp_client):
     tools = {tool.name: tool for tool in await mcp_client.list_tools()}
-    retrieve = tools["retrieve_documents"]
+    retrieve = tools["retrieve"]
     schema = retrieve.input_schema
 
-    assert set(schema["required"]) == {"index", "query"}
+    assert set(schema["required"]) == {"indices", "query"}
+    assert schema["properties"]["indices"]["type"] == "array"
     assert schema["properties"]["method"]["default"] == "rrf"
-    assert "list_indices" in retrieve.description
+    assert "filters" not in schema["properties"]
+    assert "get_indices" in retrieve.description
     # Each strategy is explained in the description the model reads.
     for method in RetrieveMethod:
         assert f"`{method.value}`" in retrieve.description
@@ -46,7 +48,7 @@ async def test_list_indices_returns_names_and_descriptions(mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(
         return_value=httpx.Response(200, json=[{"name": "faq", "description": "Customer FAQ"}])
     )
-    payload = _payload(await mcp_client.call_tool("list_indices", {}))
+    payload = _payload(await mcp_client.call_tool("get_indices", {}))
     assert payload["total"] == 1
     assert payload["indices"][0] == {
         "name": "faq",
@@ -64,7 +66,7 @@ async def test_retrieve_defaults_to_rrf(mcp_client):
         return_value=httpx.Response(200, json={"documents": [{"id": "1", "content": "refund"}]})
     )
     payload = _payload(
-        await mcp_client.call_tool("retrieve_documents", {"index": "faq", "query": "refund"})
+        await mcp_client.call_tool("retrieve", {"indices": ["faq"], "query": "refund"})
     )
 
     assert rrf.call_count == 1
@@ -82,9 +84,7 @@ async def test_each_method_reaches_its_own_endpoint(mcp_client, method):
         for candidate in RetrieveMethod
     }
     payload = _payload(
-        await mcp_client.call_tool(
-            "retrieve_documents", {"index": "faq", "query": "q", "method": method}
-        )
+        await mcp_client.call_tool("retrieve", {"indices": ["faq"], "query": "q", "method": method})
     )
 
     assert payload["method"] == method
@@ -95,9 +95,7 @@ async def test_each_method_reaches_its_own_endpoint(mcp_client, method):
 async def test_an_unknown_method_is_rejected_with_the_valid_options(mcp_client):
     """A schema violation must tell the caller what to send instead of being masked."""
     with pytest.raises(ToolError) as excinfo:
-        await mcp_client.call_tool(
-            "retrieve_documents", {"index": "faq", "query": "q", "method": "bm42"}
-        )
+        await mcp_client.call_tool("retrieve", {"indices": ["faq"], "query": "q", "method": "bm42"})
 
     message = str(excinfo.value)
     assert "[INVALID_INPUT]" in message
@@ -109,8 +107,70 @@ async def test_an_unknown_method_is_rejected_with_the_valid_options(mcp_client):
 @respx.mock
 async def test_top_k_defaults_to_the_configured_value(mcp_client, settings):
     route = respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
-    await mcp_client.call_tool("retrieve_documents", {"index": "faq", "query": "q"})
+    await mcp_client.call_tool("retrieve", {"indices": ["faq"], "query": "q"})
     assert json.loads(route.calls.last.request.read())["top_k"] == settings.default_top_k
+
+
+@respx.mock
+async def test_several_indices_reach_the_backend_comma_joined(mcp_client):
+    route = respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
+    payload = _payload(
+        await mcp_client.call_tool("retrieve", {"indices": ["faq", "manuals"], "query": "refund"})
+    )
+
+    assert json.loads(route.calls.last.request.read())["Index_name"] == "faq,manuals"
+    assert payload["indices"] == ["faq", "manuals"]
+
+
+@respx.mock
+async def test_blank_and_duplicate_indices_are_dropped(mcp_client):
+    route = respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
+    await mcp_client.call_tool(
+        "retrieve", {"indices": [" faq ", "", "manuals", "faq"], "query": "q"}
+    )
+    assert json.loads(route.calls.last.request.read())["Index_name"] == "faq,manuals"
+
+
+@respx.mock
+async def test_an_empty_index_selection_is_rejected(mcp_client):
+    route = respx.post(f"{BASE_URL}/retrieve-rrf")
+    with pytest.raises(ToolError) as excinfo:
+        await mcp_client.call_tool("retrieve", {"indices": ["  "], "query": "q"})
+
+    assert "[INVALID_INPUT]" in str(excinfo.value)
+    assert "get_indices" in str(excinfo.value)
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_permission_groups_are_forwarded_verbatim(mcp_client):
+    route = respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
+    await mcp_client.call_tool(
+        "retrieve",
+        {"indices": ["faq"], "query": "q", "permission_groups": ["rag-internal", "billing"]},
+    )
+
+    sent = json.loads(route.calls.last.request.read())
+    assert sent["permission_groups"] == ["rag-internal", "billing"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({"indices": ["faq"], "query": "q"}, id="omitted"),
+        pytest.param({"indices": ["faq"], "query": "q", "permission_groups": []}, id="empty"),
+    ],
+)
+@respx.mock
+async def test_permission_groups_fall_back_to_the_configured_default(
+    mcp_client, settings, arguments
+):
+    route = respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
+    await mcp_client.call_tool("retrieve", arguments)
+
+    sent = json.loads(route.calls.last.request.read())
+    assert sent["permission_groups"] == settings.default_permission_groups
+    assert sent["permission_groups"] == ["rag-public"]
 
 
 # --------------------------------------------------------------------------- #
@@ -119,7 +179,7 @@ async def test_top_k_defaults_to_the_configured_value(mcp_client, settings):
 @respx.mock
 async def test_caller_credentials_are_forwarded_to_the_backend(mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(200, json=[]))
-    await mcp_client.call_tool("list_indices", {})
+    await mcp_client.call_tool("get_indices", {})
 
     forwarded = respx.calls.last.request.headers
     assert forwarded["authorization"] == AUTHORIZATION
@@ -140,7 +200,7 @@ async def test_missing_credentials_are_reported_without_calling_the_backend(conn
     route = respx.get(f"{BASE_URL}/indices")
     async with connect(headers) as connected:
         with pytest.raises(ToolError) as excinfo:
-            await connected.call_tool("list_indices", {})
+            await connected.call_tool("get_indices", {})
 
     assert "[MISSING_CREDENTIALS]" in str(excinfo.value)
     assert route.call_count == 0
@@ -150,7 +210,7 @@ async def test_missing_credentials_are_reported_without_calling_the_backend(conn
 async def test_credential_values_are_never_echoed_back_to_the_caller(connect):
     async with connect({"authorization": AUTHORIZATION}) as connected:
         with pytest.raises(ToolError) as excinfo:
-            await connected.call_tool("list_indices", {})
+            await connected.call_tool("get_indices", {})
     assert AUTHORIZATION not in str(excinfo.value)
 
 
@@ -161,11 +221,11 @@ async def test_concurrent_callers_do_not_share_credentials(connect):
     other = {"authorization": "Bearer other-token", "x-api-key": "other-key"}
 
     async with connect() as first:
-        await first.call_tool("list_indices", {})
+        await first.call_tool("get_indices", {})
         assert respx.calls.last.request.headers["authorization"] == AUTHORIZATION
 
     async with connect(other) as second:
-        await second.call_tool("list_indices", {})
+        await second.call_tool("get_indices", {})
         assert respx.calls.last.request.headers["authorization"] == "Bearer other-token"
 
 
@@ -176,7 +236,7 @@ async def test_concurrent_callers_do_not_share_credentials(connect):
 async def test_blank_query_is_rejected_before_any_backend_call(mcp_client):
     route = respx.post(f"{BASE_URL}/retrieve-rrf")
     with pytest.raises(ToolError) as excinfo:
-        await mcp_client.call_tool("retrieve_documents", {"index": "faq", "query": "   "})
+        await mcp_client.call_tool("retrieve", {"indices": ["faq"], "query": "   "})
 
     assert "[INVALID_INPUT]" in str(excinfo.value)
     assert route.call_count == 0
@@ -185,8 +245,8 @@ async def test_blank_query_is_rejected_before_any_backend_call(mcp_client):
 async def test_top_k_above_the_cap_is_rejected(mcp_client, settings):
     with pytest.raises(ToolError) as excinfo:
         await mcp_client.call_tool(
-            "retrieve_documents",
-            {"index": "faq", "query": "q", "top_k": settings.max_top_k + 1},
+            "retrieve",
+            {"indices": ["faq"], "query": "q", "top_k": settings.max_top_k + 1},
         )
     assert "[INVALID_INPUT]" in str(excinfo.value)
 
@@ -195,7 +255,7 @@ async def test_top_k_above_the_cap_is_rejected(mcp_client, settings):
 async def test_backend_error_reaches_the_client_with_its_code(mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(404))
     with pytest.raises(ToolError) as excinfo:
-        await mcp_client.call_tool("list_indices", {})
+        await mcp_client.call_tool("get_indices", {})
     assert "[BACKEND_NOT_FOUND]" in str(excinfo.value)
 
 
@@ -203,7 +263,7 @@ async def test_backend_error_reaches_the_client_with_its_code(mcp_client):
 async def test_retryable_error_tells_the_client_to_retry(mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(503))
     with pytest.raises(ToolError) as excinfo:
-        await mcp_client.call_tool("list_indices", {})
+        await mcp_client.call_tool("get_indices", {})
 
     message = str(excinfo.value)
     assert "[BACKEND_SERVER_ERROR]" in message
@@ -216,7 +276,7 @@ async def test_backend_error_body_is_not_leaked_to_the_client(mcp_client):
         return_value=httpx.Response(500, text="Traceback: /srv/app/internal.py line 42")
     )
     with pytest.raises(ToolError) as excinfo:
-        await mcp_client.call_tool("list_indices", {})
+        await mcp_client.call_tool("get_indices", {})
     assert "internal.py" not in str(excinfo.value)
 
 
@@ -226,7 +286,7 @@ async def test_unexpected_errors_are_masked(mcp_client, client, monkeypatch):
 
     monkeypatch.setattr(client, "list_indices", boom)
     with pytest.raises(ToolError) as excinfo:
-        await mcp_client.call_tool("list_indices", {})
+        await mcp_client.call_tool("get_indices", {})
 
     message = str(excinfo.value)
     assert message == GENERIC_ERROR_MESSAGE
@@ -244,10 +304,10 @@ def _json_logs(capsys):
 @respx.mock
 async def test_each_call_is_logged_with_a_correlation_id(capsys, mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(200, json=[]))
-    await mcp_client.call_tool("list_indices", {})
+    await mcp_client.call_tool("get_indices", {})
 
     by_event = {entry["event"]: entry for entry in _json_logs(capsys)}
-    assert by_event["tool.call.start"]["tool_name"] == "list_indices"
+    assert by_event["tool.call.start"]["tool_name"] == "get_indices"
     assert by_event["tool.call.finished"]["outcome"] == "success"
     assert by_event["tool.call.finished"]["duration_ms"] >= 0
     assert by_event["tool.call.start"]["request_id"] == by_event["tool.call.finished"]["request_id"]
@@ -256,11 +316,9 @@ async def test_each_call_is_logged_with_a_correlation_id(capsys, mcp_client):
 @respx.mock
 async def test_the_retrieval_method_is_logged(capsys, mcp_client):
     respx.post(f"{BASE_URL}/retrieve-knn").mock(return_value=httpx.Response(200, json=[]))
-    await mcp_client.call_tool(
-        "retrieve_documents", {"index": "faq", "query": "q", "method": "knn"}
-    )
+    await mcp_client.call_tool("retrieve", {"indices": ["faq"], "query": "q", "method": "knn"})
 
-    results = [e for e in _json_logs(capsys) if e["event"] == "tool.retrieve_documents.result"]
+    results = [e for e in _json_logs(capsys) if e["event"] == "tool.retrieve.result"]
     assert results and results[0]["method"] == "knn"
 
 
@@ -268,7 +326,7 @@ async def test_the_retrieval_method_is_logged(capsys, mcp_client):
 async def test_failures_are_logged_with_their_error_code(capsys, mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(404))
     with pytest.raises(ToolError):
-        await mcp_client.call_tool("list_indices", {})
+        await mcp_client.call_tool("get_indices", {})
 
     failures = [e for e in _json_logs(capsys) if e["event"] == "tool.call.failed"]
     assert failures and failures[0]["code"] == "BACKEND_NOT_FOUND"
@@ -277,7 +335,7 @@ async def test_failures_are_logged_with_their_error_code(capsys, mcp_client):
 @respx.mock
 async def test_credentials_never_appear_in_the_log_stream(capsys, mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(200, json=[]))
-    await mcp_client.call_tool("list_indices", {})
+    await mcp_client.call_tool("get_indices", {})
 
     captured = capsys.readouterr().err
     assert AUTHORIZATION not in captured

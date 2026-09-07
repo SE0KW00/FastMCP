@@ -61,6 +61,10 @@ class Handler(BaseHTTPRequestHandler):
 
         query = request.get("query", "")
         top_k = int(request.get("top_k", 5))
+        # The server sends the indices as one comma-joined string under a
+        # capital-I key; split it back so the canned hits look plausible.
+        indices = [name for name in request.get("Index_name", "").split(",") if name]
+        groups = request.get("permission_groups", [])
         self._reply(
             {
                 "documents": [
@@ -68,7 +72,11 @@ class Handler(BaseHTTPRequestHandler):
                         "_id": f"{method}-{rank}",
                         "_score": round(3.0 - rank * 0.4, 2),
                         "text": f"[{method}] result {rank} for {query!r}",
-                        "_source": {"index": request.get("index"), "rank": rank},
+                        "_source": {
+                            "index": indices[(rank - 1) % len(indices)] if indices else None,
+                            "permission_groups": groups,
+                            "rank": rank,
+                        },
                     }
                     for rank in range(1, top_k + 1)
                 ]

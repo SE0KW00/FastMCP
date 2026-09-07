@@ -8,16 +8,16 @@
 
 | MCP 도구 | 백엔드 엔드포인트 | 하는 일 |
 | --- | --- | --- |
-| `list_indices` | `GET /indices` | 검색 가능한 인덱스 이름과 설명을 반환 |
-| `retrieve_documents` | `POST /retrieve-{method}` | 선택한 검색 전략으로 문서를 검색 |
+| `get_indices` | `GET /indices` | 검색 가능한 인덱스 이름과 설명을 반환 |
+| `retrieve` | `POST /retrieve-{method}` | 선택한 검색 전략으로 여러 인덱스에서 문서를 검색 |
 
 검색 전략은 백엔드에서 각각 별도의 엔드포인트(`/retrieve-bm25`, `/retrieve-knn`,
 `/retrieve-cc`, `/retrieve-rrf`)로 제공되며, MCP에서는 하나의 도구에 `method` 인자로
-노출합니다. 기본값은 `rrf`입니다.
+노출합니다. 기본값은 `rrf`입니다. `retrieve`는 인덱스를 여러 개 받을 수 있습니다.
 
 두 도구 모두 읽기 전용(`readOnlyHint`)이며, 구조화 로깅과 중앙집중식 에러 처리를
 거칩니다. **API 키는 서버에 저장되지 않고**, MCP 클라이언트가 요청 헤더로 보낸 값을
-그대로 백엔드로 전달합니다 (§4 참고).
+그대로 백엔드로 전달합니다 (§3 참고).
 
 ---
 
@@ -31,8 +31,8 @@ MCP 클라이언트
 │ server.py          컴포지션 루트              │
 │  ├─ middleware.py  호출 로깅 · 에러 백스톱     │
 │  └─ tools/         MCP 도구 정의              │
-│       ├─ indices.py     list_indices          │
-│       └─ retrieve.py    retrieve_documents    │
+│       ├─ indices.py     get_indices           │
+│       └─ retrieve.py    retrieve              │
 │            │                                  │
 │            ├─ credentials.py 호출자 키 추출    │
 │            ├─ errors.py     도구 에러 경계     │
@@ -102,10 +102,24 @@ MCP 클라이언트
 네 엔드포인트의 요청/응답 형태는 동일합니다. 요청 본문:
 
 ```json
-{ "index": "faq", "query": "환불 규정", "top_k": 5, "filters": { "lang": "ko" } }
+{
+  "Index_name": "faq,manuals",
+  "query": "환불 규정",
+  "top_k": 5,
+  "permission_groups": ["rag-public"]
+}
 ```
 
-`filters`는 값이 있을 때만 포함됩니다. 응답:
+본문 필드에 두 가지 주의점이 있습니다.
+
+* **`Index_name`** — 대문자 `I`이며, 인덱스가 여러 개여도 **리스트가 아니라 콤마로 이은
+  하나의 문자열**로 보냅니다. 도구 쪽 인자는 `indices: list[str]`이고 이 변환은
+  `backend/client.py`의 `INDEX_FIELD` 근처에서만 일어납니다.
+* **`permission_groups`** — 호출자가 준 값을 가공 없이 그대로 싣습니다. 주지 않았으면
+  `ES_MCP_DEFAULT_PERMISSION_GROUPS`(기본 `["rag-public"]`)가 들어갑니다. 항상 포함되는
+  필드입니다.
+
+응답:
 
 ```json
 {
@@ -186,6 +200,7 @@ cp .env.example .env
 | `ES_MCP_MAX_RETRIES` | `2` | 일시적 실패에 대한 재시도 횟수 |
 | `ES_MCP_DEFAULT_TOP_K` / `ES_MCP_MAX_TOP_K` | `5` / `50` | 검색 결과 개수 기본값과 상한 |
 | `ES_MCP_DEFAULT_RETRIEVE_METHOD` | `rrf` | `method`를 지정하지 않았을 때의 전략 |
+| `ES_MCP_DEFAULT_PERMISSION_GROUPS` | `["rag-public"]` | `permission_groups`를 주지 않았을 때의 값 |
 | `ES_MCP_LOG_LEVEL` / `ES_MCP_LOG_FORMAT` | `INFO` / `json` | 로그 레벨과 형식 |
 | `ES_MCP_MASK_ERROR_DETAILS` | `true` | 예기치 못한 에러의 내부 정보를 감출지 여부 |
 | `ES_MCP_TRANSPORT` | `http` | `http`, `sse`, `stdio` (stdio는 자격증명 전달 불가) |
@@ -298,8 +313,8 @@ async def main():
     async with Client(transport) as client:
         print([t.name for t in await client.list_tools()])
         result = await client.call_tool(
-            "retrieve_documents",
-            {"index": "faq", "query": "환불 규정", "method": "bm25", "top_k": 2},
+            "retrieve",
+            {"indices": ["faq", "manuals"], "query": "환불 규정", "method": "bm25", "top_k": 2},
         )
         print(result.structured_content)
 
@@ -333,8 +348,8 @@ curl -sS -o /dev/null -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
 curl -sS -N -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
   -H "mcp-session-id: $SID" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-       "name":"retrieve_documents",
-       "arguments":{"index":"faq","query":"환불 규정","method":"bm25"}}}' \
+       "name":"retrieve",
+       "arguments":{"indices":["faq","manuals"],"query":"환불 규정","method":"bm25"}}}' \
   | sed -n 's/^data: //p'
 ```
 
@@ -355,8 +370,8 @@ curl -sS -N -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
 
 ```json
 {"timestamp":"2026-09-03T00:34:57Z","level":"INFO","logger":"es_search_mcp.middleware",
- "event":"tool.call.start","arguments":{"index":"faq","query":"환불"},
- "request_id":"8accd74976a34db7","tool_name":"retrieve_documents"}
+ "event":"tool.call.start","arguments":{"indices":["faq"],"query":"환불"},
+ "request_id":"8accd74976a34db7","tool_name":"retrieve"}
 ```
 
 주요 이벤트:
@@ -369,7 +384,7 @@ curl -sS -N -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
 | `backend.request` / `backend.response` | 백엔드 호출 (`status_code`, `elapsed_ms`) |
 | `backend.retry` | 재시도 (`attempt`, `delay_seconds`, `error_code`) |
 | `tool.error` / `tool.unhandled_error` | 에러 경계가 잡은 실패의 상세 |
-| `tool.retrieve_documents.result` | 사용한 `method`, `top_k`, 결과 개수 |
+| `tool.retrieve.result` | 사용한 `indices`, `method`, `top_k`, `permission_groups`, 결과 개수 |
 
 `request_id`는 백엔드로 나가는 요청의 `X-Request-ID` 헤더로도 전달되므로, MCP 서버
 로그와 백엔드 로그를 같은 키로 이어 붙일 수 있습니다.
@@ -509,7 +524,7 @@ mypy
 | `test_credentials.py` | 헤더 추출, 누락 처리, 헤더 이름 설정 |
 | `test_errors.py` | 에러 경계의 변환과 마스킹 |
 | `test_logging.py` | 포맷터, 컨텍스트 바인딩, 마스킹, stderr 보장 |
-| `test_server_tools.py` | 인메모리 MCP 클라이언트로 전 계층 통합 |
+| `test_server_tools.py` | 실제 ASGI 앱을 통한 전 계층 통합 (도구명·인자·자격증명) |
 
 통합 테스트는 실제 ASGI 앱을 인프로세스로 띄워(`httpx2.ASGITransport`, 소켓 없음)
 자격증명 헤더까지 실제 경로로 지나갑니다. MCP 클라이언트는 `httpx2`를, 백엔드 클라이언트는

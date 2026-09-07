@@ -80,6 +80,13 @@ class Settings(BaseSettings):
         default=RetrieveMethod.RRF,
         description="Retrieval strategy used when the caller does not name one.",
     )
+    default_permission_groups: list[str] = Field(
+        default=["rag-public"],
+        description=(
+            "Permission groups sent to the backend when the caller does not supply "
+            "any. Set it to the group that carries no special access."
+        ),
+    )
 
     # --- Observability ---------------------------------------------------
     log_level: LogLevel = Field(default="INFO", description="Root log level for the server.")
