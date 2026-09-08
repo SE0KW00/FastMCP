@@ -61,6 +61,7 @@ MCP 클라이언트
 | `tools/` | MCP 도구 정의 (입력 검증 + 백엔드 호출 + 결과 로깅) |
 | `server.py` | 설정·클라이언트·미들웨어·도구를 조립하는 유일한 진입점 |
 | `scripts/fake_backend.py` | 로컬 확인용 가짜 백엔드 (표준 라이브러리만 사용) |
+| `Dockerfile` | 2단계 빌드 · 비루트 실행 이미지 (§6) |
 
 **의존성은 명시적으로 주입합니다.** 도구는 `register(mcp, client, settings)` 형태로
 등록되며 전역 상태를 참조하지 않습니다. 덕분에 테스트에서 스텁 클라이언트를 그대로
@@ -355,7 +356,71 @@ curl -sS -N -X POST http://127.0.0.1:8080/mcp "${AUTH[@]}" \
 
 ---
 
-## 6. 커스텀 로깅
+## 6. Docker
+
+```bash
+docker build -t es-search-mcp:0.1.0 .
+
+docker run --rm -p 8080:8080 \
+  -e ES_MCP_BACKEND_BASE_URL=https://search-api.internal \
+  es-search-mcp:0.1.0
+```
+
+컨테이너는 `http://<host>:8080/mcp/`에서 MCP Streamable HTTP를 서빙합니다.
+
+### 이미지 설계
+
+| 결정 | 이유 |
+| --- | --- |
+| 2단계 빌드 | 빌더에만 `uv`와 빌드 도구가 들어가고, 런타임 이미지에는 venv만 남습니다 |
+| 의존성 → 소스 순으로 COPY | `uv.lock`이 바뀌지 않으면 의존성 레이어를 재사용하므로, 코드 수정 시 빌드가 빠릅니다 |
+| `uv sync --frozen` | `uv.lock`에 고정된 버전 그대로 설치합니다. 빌드마다 결과가 달라지지 않습니다 |
+| `uv`를 PyPI에서 설치 | 레지스트리를 하나 더(ghcr 등) 뚫지 않아도 됩니다. 베이스 이미지 + 패키지 인덱스면 충분합니다 |
+| `UV_PYTHON_DOWNLOADS=never` | uv가 자체 파이썬을 내려받으면 venv가 런타임 스테이지에 없는 인터프리터를 가리키게 됩니다 |
+| `--no-editable` | venv 안에 실제 사본이 설치되므로, 런타임 스테이지는 `/app/.venv`만 있으면 됩니다 |
+| 비루트(uid 10001) 실행 | 프로세스가 필요한 건 자기 코드 읽기와 소켓 열기뿐입니다 |
+| ENTRYPOINT exec 형식 | 서버가 PID 1이 되어 `docker stop`의 SIGTERM을 직접 받고 연결을 정리합니다 |
+
+**`ES_MCP_HOST`는 이미지에서 `0.0.0.0`으로 바꿔 둡니다.** 앱 기본값인 `127.0.0.1`은
+컨테이너 안에서만 닿을 수 있어 `-p`로 포트를 열어도 접속되지 않습니다.
+
+파이썬 버전은 빌드 인자입니다.
+
+```bash
+docker build --build-arg PYTHON_VERSION=3.13 -t es-search-mcp:0.1.0 .
+```
+
+### 설정 주입
+
+이미지에는 **비밀값이 들어 있지 않습니다.** API 키는 빌드 타임에도, 환경변수로도
+필요하지 않습니다 — 호출자가 매 요청 헤더로 보냅니다 (§3).
+
+주입해야 할 것은 백엔드 주소 정도이고, 나머지는 §4의 `ES_MCP_*`를 `-e`나
+`--env-file`로 덮어쓰면 됩니다.
+
+```bash
+docker run --rm -p 8080:8080 --env-file .env es-search-mcp:0.1.0
+```
+
+### 헬스체크
+
+`HEALTHCHECK`는 포트가 열려 있는지만 확인합니다. MCP 호출에는 세션과 호출자
+자격증명이 필요해서, 인증 없이 찔러볼 수 있는 엔드포인트가 없기 때문입니다.
+백엔드 도달 가능성까지 보는 readiness 프로브가 필요하면 앱에 `/health` 라우트를
+추가하고 헬스체크를 그쪽으로 바꾸세요.
+
+### 로그
+
+로그는 stderr로 나가는 JSON 한 줄 단위라 `docker logs`와 로그 수집기가 그대로
+읽습니다. 사람이 볼 용도면 `-e ES_MCP_LOG_FORMAT=text`.
+
+```bash
+docker logs -f <container> | jq 'select(.event | startswith("tool."))'
+```
+
+---
+
+## 7. 커스텀 로깅
 
 `logging.py`가 담당하며, 설계상 두 가지 제약을 지킵니다.
 
@@ -404,7 +469,7 @@ logger.info("backend.request", fields={"method": "GET", "path": "/indices"})
 
 ---
 
-## 7. 커스텀 에러 처리
+## 8. 커스텀 에러 처리
 
 ### 예외 계층
 
@@ -471,7 +536,7 @@ middleware.py      도구 "바깥"에서 난 에러의 백스톱 + 호출 결과
 
 ---
 
-## 8. 개발
+## 9. 개발
 
 `uv`를 쓰는 경우:
 
