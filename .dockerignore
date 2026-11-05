@@ -1,0 +1,38 @@
+# Keep the build context to what the image actually needs: pyproject.toml,
+# uv.lock, README.md and src/. Everything else only slows the build down or
+# risks baking local state — a .env with real keys above all — into a layer.
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Virtualenvs and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# VCS and CI
+.git/
+.gitignore
+.github/
+
+# Tooling and editor state
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Not part of the runtime image
+tests/
+scripts/
+Dockerfile
+.dockerignore
+docker-compose*.yml
