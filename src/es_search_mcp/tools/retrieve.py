@@ -23,6 +23,7 @@ from es_search_mcp.credentials import resolve_credentials
 from es_search_mcp.errors import tool_error_boundary
 from es_search_mcp.exceptions import InvalidInputError
 from es_search_mcp.logging import get_logger
+from es_search_mcp.metrics import record_documents_returned
 from es_search_mcp.models import RETRIEVE_METHOD_GUIDE, RetrieveMethod, RetrieveResult
 
 logger = get_logger(__name__)
@@ -128,6 +129,7 @@ def register(mcp: FastMCP, client: SearchBackendClient, settings: Settings) -> N
                 method=method,
                 permission_groups=effective_groups,
             )
+            record_documents_returned(method=method.value, count=result.total)
             logger.info(
                 "tool.retrieve.result",
                 fields={

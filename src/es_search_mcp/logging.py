@@ -28,6 +28,8 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
 
+from opentelemetry import trace
+
 LOGGER_NAMESPACE = "es_search_mcp"
 
 #: Field names whose values are never written to the log stream.
@@ -119,11 +121,32 @@ def redact(value: Any, *, _depth: int = 0) -> Any:
 # --------------------------------------------------------------------------- #
 # Formatters and filters
 # --------------------------------------------------------------------------- #
+def current_trace_context() -> dict[str, str]:
+    """Return the active trace and span ids, in the spelling Elastic expects.
+
+    Elastic correlates logs with APM traces on the ECS fields ``trace.id`` and
+    ``span.id``, so those are the names used here rather than the OpenTelemetry
+    attribute spelling. Returns an empty dict when no span is recording — an
+    invalid all-zero id in the log stream would be worse than no field at all.
+
+    Records exported over OTLP get their trace context from the SDK itself; this
+    is what makes the same correlation work for the stderr stream, which is how
+    most deployments actually collect logs.
+    """
+    span_context = trace.get_current_span().get_span_context()
+    if not span_context.is_valid:
+        return {}
+    return {
+        "trace.id": trace.format_trace_id(span_context.trace_id),
+        "span.id": trace.format_span_id(span_context.span_id),
+    }
+
+
 class CallContextFilter(logging.Filter):
-    """Attach the bound call context to every record passing through."""
+    """Attach the bound call context and trace context to every record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        for key, value in current_call_context().items():
+        for key, value in (current_call_context() | current_trace_context()).items():
             if not hasattr(record, key):
                 setattr(record, key, value)
         return True
@@ -211,9 +234,13 @@ def configure_logging(level: str = "INFO", log_format: str = "json") -> None:
     handler.addFilter(CallContextFilter())
 
     logger = logging.getLogger(LOGGER_NAMESPACE)
+    # Replace only our own handler. Anything else on this logger was attached by
+    # another layer — the OTLP log bridge above all — and removing it here would
+    # silently stop log export the next time logging is reconfigured.
     for existing in list(logger.handlers):
-        logger.removeHandler(existing)
-        existing.close()
+        if isinstance(existing, StderrHandler):
+            logger.removeHandler(existing)
+            existing.close()
     logger.addHandler(handler)
     logger.setLevel(level.upper())
     logger.propagate = False
@@ -223,7 +250,8 @@ def configure_logging(level: str = "INFO", log_format: str = "json") -> None:
     for name in ("fastmcp", "httpx", "httpcore", "mcp"):
         third_party = logging.getLogger(name)
         for existing in list(third_party.handlers):
-            third_party.removeHandler(existing)
+            if isinstance(existing, StderrHandler):
+                third_party.removeHandler(existing)
         third_party.addHandler(handler)
         third_party.setLevel(max(logging.getLevelName(level.upper()), logging.WARNING))
         third_party.propagate = False

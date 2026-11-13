@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 
 import httpx
 import httpx2
@@ -53,16 +54,15 @@ def credentials() -> BackendCredentials:
     return BackendCredentials(authorization=AUTHORIZATION, api_key=API_KEY)
 
 
-@pytest.fixture
-async def mcp_app(settings: Settings, client: SearchBackendClient) -> AsyncIterator[Starlette]:
-    """The server as an ASGI app, wired to the stubbed backend client.
+@asynccontextmanager
+async def running_app(app: Starlette) -> AsyncIterator[Starlette]:
+    """Run an ASGI app's lifespan for the duration of the block.
 
     The lifespan is entered and exited inside one long-lived task. pytest-asyncio
     runs a fixture's setup and teardown halves in *different* tasks, and the
     session manager's cancel scope cannot be exited from a task other than the
     one that entered it; the events below keep both halves in the same task.
     """
-    app = create_server(settings, client=client).http_app()
     started, stop = asyncio.Event(), asyncio.Event()
 
     async def run_lifespan() -> None:
@@ -79,21 +79,55 @@ async def mcp_app(settings: Settings, client: SearchBackendClient) -> AsyncItera
         await task
 
 
+def client_for(app: Starlette, headers: dict[str, str] | None = None) -> Client:
+    """An MCP client speaking real HTTP to ``app``, over no socket."""
+
+    def httpx_client_factory(**kwargs: object) -> httpx2.AsyncClient:
+        return httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), **kwargs)  # type: ignore[arg-type]
+
+    return Client(
+        StreamableHttpTransport(
+            MCP_URL,
+            headers=CREDENTIAL_HEADERS if headers is None else headers,
+            httpx_client_factory=httpx_client_factory,
+        )
+    )
+
+
+@pytest.fixture
+async def mcp_app(settings: Settings, client: SearchBackendClient) -> AsyncIterator[Starlette]:
+    """The server as an ASGI app, wired to the stubbed backend client."""
+    async with running_app(create_server(settings, client=client).http_app()) as app:
+        yield app
+
+
 @pytest.fixture
 def connect(mcp_app: Starlette) -> Callable[..., Client]:
     """Return a factory that connects an MCP client with the given headers."""
 
     def factory(headers: dict[str, str] | None = None) -> Client:
-        def httpx_client_factory(**kwargs: object) -> httpx2.AsyncClient:
-            return httpx2.AsyncClient(transport=httpx2.ASGITransport(app=mcp_app), **kwargs)  # type: ignore[arg-type]
+        return client_for(mcp_app, headers)
 
-        return Client(
-            StreamableHttpTransport(
-                MCP_URL,
-                headers=CREDENTIAL_HEADERS if headers is None else headers,
-                httpx_client_factory=httpx_client_factory,
-            )
-        )
+    return factory
+
+
+@pytest.fixture
+def serve(client: SearchBackendClient):
+    """Serve and connect to a server built from settings of the test's choosing.
+
+    For the cases that are *about* a setting, rather than about a tool::
+
+        async with serve(settings.model_copy(update={...})) as connected:
+            await connected.call_tool(...)
+    """
+
+    @asynccontextmanager
+    async def factory(
+        custom: Settings, headers: dict[str, str] | None = None
+    ) -> AsyncIterator[Client]:
+        app = create_server(custom, client=client).http_app()
+        async with running_app(app), client_for(app, headers) as connected:
+            yield connected
 
     return factory
 

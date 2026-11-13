@@ -7,6 +7,7 @@ import logging
 
 from es_search_mcp.logging import (
     JsonFormatter,
+    StderrHandler,
     TextFormatter,
     bind_call_context,
     configure_logging,
@@ -89,7 +90,27 @@ def test_logs_go_to_stderr_never_stdout(capsys):
     assert "server.starting" in captured.err
 
 
+def _stderr_handlers():
+    return [
+        handler
+        for handler in logging.getLogger("es_search_mcp").handlers
+        if isinstance(handler, StderrHandler)
+    ]
+
+
 def test_configure_logging_is_idempotent():
     configure_logging()
     configure_logging()
-    assert len(logging.getLogger("es_search_mcp").handlers) == 1
+    assert len(_stderr_handlers()) == 1
+
+
+def test_configure_logging_keeps_handlers_it_did_not_install():
+    """The OTLP log bridge lives on this logger; reconfiguring must not drop it."""
+    foreign = logging.NullHandler()
+    logging.getLogger("es_search_mcp").addHandler(foreign)
+    try:
+        configure_logging()
+        assert foreign in logging.getLogger("es_search_mcp").handlers
+        assert len(_stderr_handlers()) == 1
+    finally:
+        logging.getLogger("es_search_mcp").removeHandler(foreign)

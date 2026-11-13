@@ -77,6 +77,12 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     ES_MCP_LOG_FORMAT=json \
     ES_MCP_LOG_LEVEL=INFO
 
+# OpenTelemetry export stays off until OTEL_EXPORTER_OTLP_ENDPOINT is given at
+# run time, so this image is the same whether or not it is being monitored:
+#   -e OTEL_EXPORTER_OTLP_ENDPOINT=https://<deployment>.apm.<region>.cloud.es.io:443
+#   -e OTEL_EXPORTER_OTLP_HEADERS='Authorization=ApiKey%20<base64 key>'
+#   -e ES_MCP_TELEMETRY_ENVIRONMENT=prod
+
 WORKDIR /app
 USER 10001
 

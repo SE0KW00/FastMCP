@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from types import TracebackType
 from typing import Any
 
@@ -29,6 +30,7 @@ from es_search_mcp.exceptions import (
     error_for_status,
 )
 from es_search_mcp.logging import current_request_id, get_logger
+from es_search_mcp.metrics import record_backend_request, record_backend_retry
 from es_search_mcp.models import IndexList, RetrieveMethod, RetrieveResult
 
 logger = get_logger(__name__)
@@ -53,6 +55,15 @@ class SearchBackendClient:
             timeout=settings.request_timeout,
             headers={"Accept": "application/json"},
         )
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """The underlying client, so telemetry can instrument this instance.
+
+        Instrumenting one client rather than patching httpx globally keeps the
+        spans to the calls this server actually makes.
+        """
+        return self._client
 
     # -- lifecycle --------------------------------------------------------
     async def aclose(self) -> None:
@@ -143,6 +154,7 @@ class SearchBackendClient:
                 if not exc.retryable or attempt == attempts:
                     raise
                 delay = self._backoff_delay(attempt)
+                record_backend_retry(path=path, error_code=exc.code, attempt=attempt)
                 logger.warning(
                     "backend.retry",
                     fields={
@@ -178,18 +190,26 @@ class SearchBackendClient:
             "backend.request",
             fields={"method": method, "path": path, "attempt": attempt},
         )
+        # Measured here rather than from `response.elapsed`, so a call that
+        # never produced a response is timed too.
+        started = time.perf_counter()
+        error: BackendError
         try:
             response = await self._client.request(method, path, headers=headers, **kwargs)
         except httpx.TimeoutException as exc:
-            raise BackendTimeoutError(
+            error = BackendTimeoutError(
                 f"The backend API did not respond within {self._settings.request_timeout:g}s.",
                 details={"method": method, "path": path},
-            ) from exc
+            )
+            self._record(method, path, started, error_code=error.code)
+            raise error from exc
         except httpx.HTTPError as exc:
-            raise BackendConnectionError(
+            error = BackendConnectionError(
                 "The backend API could not be reached.",
                 details={"method": method, "path": path, "reason": type(exc).__name__},
-            ) from exc
+            )
+            self._record(method, path, started, error_code=error.code)
+            raise error from exc
 
         logger.info(
             "backend.response",
@@ -202,15 +222,43 @@ class SearchBackendClient:
         )
 
         if response.is_error:
-            raise self._error_from_response(response, method=method, path=path)
+            error = self._error_from_response(response, method=method, path=path)
+            self._record(
+                method, path, started, status_code=response.status_code, error_code=error.code
+            )
+            raise error
 
         try:
-            return response.json()
+            payload = response.json()
         except ValueError as exc:
-            raise BackendPayloadError(
+            error = BackendPayloadError(
                 "The backend API returned a body that is not valid JSON.",
                 details={"method": method, "path": path, "status_code": response.status_code},
-            ) from exc
+            )
+            self._record(
+                method, path, started, status_code=response.status_code, error_code=error.code
+            )
+            raise error from exc
+
+        self._record(method, path, started, status_code=response.status_code)
+        return payload
+
+    @staticmethod
+    def _record(
+        http_method: str,
+        path: str,
+        started: float,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        record_backend_request(
+            http_method=http_method,
+            path=path,
+            duration_seconds=time.perf_counter() - started,
+            status_code=status_code,
+            error_code=error_code,
+        )
 
     @staticmethod
     def _error_from_response(response: httpx.Response, *, method: str, path: str) -> BackendError:

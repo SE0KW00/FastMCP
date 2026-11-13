@@ -333,6 +333,35 @@ async def test_failures_are_logged_with_their_error_code(capsys, mcp_client):
 
 
 @respx.mock
+async def test_tool_arguments_are_logged_by_default(capsys, mcp_client):
+    """They are the fastest way to reproduce a bad call."""
+    respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
+    await mcp_client.call_tool("retrieve", {"indices": ["faq"], "query": "refund"})
+
+    start = next(e for e in _json_logs(capsys) if e["event"] == "tool.call.start")
+    assert start["arguments"]["query"] == "refund"
+
+
+@respx.mock
+async def test_tool_arguments_can_be_kept_out_of_the_logs(capsys, serve, settings):
+    """The query is the end user's text; it must be possible not to retain it."""
+    respx.post(f"{BASE_URL}/retrieve-rrf").mock(return_value=httpx.Response(200, json=[]))
+
+    private = settings.model_copy(update={"log_tool_arguments": False})
+    async with serve(private) as connected:
+        await connected.call_tool("retrieve", {"indices": ["faq"], "query": "secret"})
+
+    captured = capsys.readouterr().err
+    assert "secret" not in captured
+    start = next(
+        json.loads(line)
+        for line in captured.splitlines()
+        if line.startswith("{") and json.loads(line)["event"] == "tool.call.start"
+    )
+    assert "arguments" not in start
+
+
+@respx.mock
 async def test_credentials_never_appear_in_the_log_stream(capsys, mcp_client):
     respx.get(f"{BASE_URL}/indices").mock(return_value=httpx.Response(200, json=[]))
     await mcp_client.call_tool("get_indices", {})

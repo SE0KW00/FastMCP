@@ -88,10 +88,57 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- OpenTelemetry ---------------------------------------------------
+    # Endpoint, headers, protocol and sampling are read from the standard
+    # OTEL_* environment variables by the SDK itself, so they are deliberately
+    # not duplicated here. These settings cover only what the SDK has no
+    # convention for.
+    telemetry_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Turn OpenTelemetry export on or off. Left unset, it switches on "
+            "whenever OTEL_EXPORTER_OTLP_ENDPOINT (or its traces/metrics/logs "
+            "variant) is set, so an unconfigured deployment stays silent."
+        ),
+    )
+    telemetry_service_name: str = Field(
+        default="es-search-mcp",
+        description="service.name reported to APM. OTEL_SERVICE_NAME wins when set.",
+    )
+    telemetry_environment: str | None = Field(
+        default=None,
+        description="deployment.environment.name reported to APM, e.g. 'prod' or 'staging'.",
+    )
+    telemetry_metric_interval_ms: int = Field(
+        default=60_000,
+        ge=1_000,
+        description="How often metrics are pushed to the collector, in milliseconds.",
+    )
+    telemetry_export_logs: bool = Field(
+        default=True,
+        description=(
+            "Also ship log records over OTLP. Turn it off when logs are already "
+            "collected from stderr by a log shipper, to avoid indexing them twice."
+        ),
+    )
+    telemetry_console_export: bool = Field(
+        default=False,
+        description="Print spans and metrics to stderr as well. For debugging only.",
+    )
+
     # --- Observability ---------------------------------------------------
     log_level: LogLevel = Field(default="INFO", description="Root log level for the server.")
     log_format: LogFormat = Field(
         default="json", description="'json' for machine-readable logs, 'text' for humans."
+    )
+    log_tool_arguments: bool = Field(
+        default=True,
+        description=(
+            "Include the caller's tool arguments in the `tool.call.start` log "
+            "event. They are the fastest way to reproduce a bad call, but they "
+            "contain the end user's search text — turn this off where queries "
+            "must not be retained in the log store or in APM."
+        ),
     )
     mask_error_details: bool = Field(
         default=True,

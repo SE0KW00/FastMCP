@@ -36,6 +36,8 @@ MCP 클라이언트
 │            │                                  │
 │            ├─ credentials.py 호출자 키 추출    │
 │            ├─ errors.py     도구 에러 경계     │
+│            ├─ telemetry.py  OTel SDK · OTLP    │
+│            ├─ metrics.py    서비스 metrics     │
 │            ▼                                  │
 │      backend/client.py  HTTP · 재시도 · 에러변환│
 │            │                                  │
@@ -57,7 +59,9 @@ MCP 클라이언트
 | `errors.py` | 도메인 예외 → 클라이언트에게 보낼 `ToolError` 변환 경계 |
 | `models.py` | 백엔드 응답을 MCP 클라이언트용 스키마로 정규화 |
 | `backend/client.py` | HTTP 호출, 타임아웃, 재시도, 상태코드 → 도메인 예외 매핑 |
-| `middleware.py` | 도구 호출 단위 로깅, 도구 바깥에서 난 에러의 백스톱 |
+| `middleware.py` | 도구 호출 단위 로깅·측정, 도구 바깥에서 난 에러의 백스톱 |
+| `telemetry.py` | OpenTelemetry SDK 구성, OTLP 내보내기, 로그 브리지 (§7) |
+| `metrics.py` | 서비스 자체 metrics 계측기와 기록 헬퍼 |
 | `tools/` | MCP 도구 정의 (입력 검증 + 백엔드 호출 + 결과 로깅) |
 | `server.py` | 설정·클라이언트·미들웨어·도구를 조립하는 유일한 진입점 |
 | `scripts/fake_backend.py` | 로컬 확인용 가짜 백엔드 (표준 라이브러리만 사용) |
@@ -203,10 +207,18 @@ cp .env.example .env
 | `ES_MCP_DEFAULT_RETRIEVE_METHOD` | `rrf` | `method`를 지정하지 않았을 때의 전략 |
 | `ES_MCP_DEFAULT_PERMISSION_GROUPS` | `["rag-public"]` | `permission_groups`를 주지 않았을 때의 값 |
 | `ES_MCP_LOG_LEVEL` / `ES_MCP_LOG_FORMAT` | `INFO` / `json` | 로그 레벨과 형식 |
+| `ES_MCP_LOG_TOOL_ARGUMENTS` | `true` | 호출 인자(사용자 검색어 포함)를 로그에 남길지 |
+| `ES_MCP_TELEMETRY_ENABLED` | *(자동)* | OTLP 내보내기 강제 on/off. 미지정 시 엔드포인트가 있으면 on |
+| `ES_MCP_TELEMETRY_SERVICE_NAME` | `es-search-mcp` | APM에 보고할 `service.name` |
+| `ES_MCP_TELEMETRY_ENVIRONMENT` | *(없음)* | APM environment 선택자 (`prod`, `staging`, …) |
+| `ES_MCP_TELEMETRY_METRIC_INTERVAL_MS` | `60000` | metrics 전송 주기 |
+| `ES_MCP_TELEMETRY_EXPORT_LOGS` | `true` | 로그를 OTLP로도 보낼지 |
+| `ES_MCP_TELEMETRY_CONSOLE_EXPORT` | `false` | span·metrics를 stderr에도 출력 (디버깅용) |
 | `ES_MCP_MASK_ERROR_DETAILS` | `true` | 예기치 못한 에러의 내부 정보를 감출지 여부 |
 | `ES_MCP_TRANSPORT` | `http` | `http`, `sse`, `stdio` (stdio는 자격증명 전달 불가) |
 
-API 키는 여기에 넣지 않습니다 — §3을 보세요.
+API 키는 여기에 넣지 않습니다 — §3을 보세요. OTLP 엔드포인트·헤더는 표준 `OTEL_*`
+변수를 씁니다 — §7을 보세요.
 
 ---
 
@@ -420,7 +432,129 @@ docker logs -f <container> | jq 'select(.event | startswith("tool."))'
 
 ---
 
-## 7. 커스텀 로깅
+## 7. OpenTelemetry → Elastic APM
+
+trace · metrics · logs 세 가지 신호를 OTLP로 내보냅니다. Elastic APM Server는 OTLP를
+네이티브로 받으므로 **수집기(collector)를 따로 띄울 필요가 없습니다.**
+
+```
+MCP 클라이언트
+   │
+   ▼  HTTP SERVER span  ──┐
+MCP 서버                   │
+   ├─ tools/call span     ├─ 하나의 trace
+   └─ 백엔드 CLIENT span ──┘
+   │
+   ▼  OTLP/HTTP  (traces · metrics · logs)
+Elastic APM Server ──▶ Elasticsearch
+```
+
+### 켜는 방법
+
+**엔드포인트를 주면 켜집니다.** 설정하지 않으면 아무것도 내보내지 않으므로, 모니터링이
+없는 환경에서도 같은 이미지가 그대로 돕니다.
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://<deployment>.apm.<region>.cloud.es.io:443
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=ApiKey%20<base64 key>'
+export ES_MCP_TELEMETRY_ENVIRONMENT=prod
+python -m es_search_mcp
+```
+
+자체 운영 APM Server라면 secret token을 씁니다.
+
+```bash
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20<secret token>'
+```
+
+> 헤더 값은 **URL 인코딩**합니다 (`ApiKey%20...`). `OTEL_EXPORTER_OTLP_HEADERS`는
+> `key=value,key=value` 형식이라 공백과 콤마를 그대로 쓸 수 없습니다.
+
+엔드포인트·헤더·프로토콜·샘플링은 **표준 `OTEL_*` 변수**를 그대로 씁니다. 이 프로젝트가
+따로 정의하지 않으므로 OpenTelemetry 문서가 그대로 적용됩니다. `ES_MCP_TELEMETRY_*`는
+표준에 규약이 없는 것만 다룹니다 (§4).
+
+### 왜 계측 코드가 거의 없는가
+
+FastMCP 4는 **자기 자신을 이미 계측합니다.** MCP 요청마다 SERVER span을 열고
+`mcp.method.name` / `gen_ai.tool.name`을 붙이고 예외를 기록하며, 요청 `_meta`로 trace
+context를 전파합니다. 다만 OpenTelemetry **API만** 사용하므로 SDK가 없으면 전부
+no-op입니다. `telemetry.py`가 하는 일은 그 SDK 절반 — provider를 만들고 내보낼 곳을
+지정하는 것 — 이고, 그 순간부터 FastMCP가 이미 기술하던 span들이 기록되기 시작합니다.
+
+| 신호 | 출처 |
+| --- | --- |
+| MCP span | FastMCP 내장 (`tools/call retrieve`, `tools/list`, …) |
+| HTTP SERVER span | `opentelemetry-instrumentation-asgi` |
+| 백엔드 CLIENT span | `opentelemetry-instrumentation-httpx` (이 서버의 클라이언트만 계측) |
+| metrics | `metrics.py` + 위 두 계측이 주는 HTTP 지표 |
+| logs | `logging.py`의 구조화 레코드를 OTLP로 브리지 |
+
+### metrics
+
+| 이름 | 종류 | 속성 |
+| --- | --- | --- |
+| `mcp.server.tool.calls` | counter | `gen_ai.tool.name`, `outcome`, `error.type` |
+| `mcp.server.tool.duration` | histogram (s) | 위와 동일 |
+| `search.backend.requests` | counter | `http.request.method`, `url.path`, `http.response.status_code`, `outcome`, `error.type` |
+| `search.backend.duration` | histogram (s) | 위와 동일 |
+| `search.backend.retries` | counter | `url.path`, `error.type`, `retry.attempt` |
+| `search.documents.returned` | histogram | `search.method` |
+
+여기에 두 계측이 `http.server.request.duration`, `http.client.request.duration` 등을
+공짜로 더해줍니다.
+
+`url.path`는 설정된 엔드포인트 경로만 들어가고 호출자 입력은 절대 들어가지 않습니다 —
+카디널리티가 터지지 않도록 의도한 것입니다.
+
+### logs ↔ traces 상관관계
+
+로그 레코드는 그걸 만든 호출의 trace context를 함께 가집니다.
+
+* **OTLP로 내보내는 로그**는 SDK가 trace context를 붙여주므로 APM에서 바로 연결됩니다.
+* **stderr 스트림**에는 `trace.id` / `span.id`를 ECS 필드명으로 직접 실어줍니다. 로그를
+  stderr에서 수집하는 (대부분의) 배포에서도 같은 연결이 되도록 한 것입니다.
+
+```json
+{"timestamp":"...","level":"INFO","event":"tool.call.finished","duration_ms":5.1,
+ "trace.id":"5e1b017043194be824d45e9ffc1be03c","span.id":"c1715c2715b23e49",
+ "request_id":"49f5f795cbe14d42","tool_name":"retrieve"}
+```
+
+span 안이 아닐 때는 두 필드를 아예 넣지 않습니다. 0으로 채운 id는 없는 것보다 나쁩니다.
+
+로그를 이미 stderr에서 수집하고 있다면 이중 색인을 피하려고
+`ES_MCP_TELEMETRY_EXPORT_LOGS=false`로 끄면 됩니다.
+
+### 짚어둘 것
+
+* **쿼리 텍스트가 APM에 들어갑니다.** `tool.call.start`가 호출 인자를 기록하고, 거기엔
+  최종 사용자의 검색어가 들어 있습니다. 보관하면 안 되는 환경이라면
+  `ES_MCP_LOG_TOOL_ARGUMENTS=false`로 끄세요 (stderr·OTLP 양쪽에 동시 적용).
+  자격증명은 애초에 도구 인자가 아니라 헤더로 오므로 여기에 포함되지 않습니다.
+* **ASGI 하위 span은 제외했습니다.** 기본값이면 요청마다 ASGI 메시지별 내부 span이
+  생겨 trace의 3/4를 차지하면서 아무것도 알려주지 않습니다 (`exclude_spans`).
+* **HTTP 속성은 현행 semconv로 통일했습니다.** 계측 라이브러리들이 아직 1.0 이전 이름
+  (`http.method`)을 기본으로 쓰는데, 그러면 이 서버가 자체 metrics에 붙이는
+  `http.request.method`와 조인이 안 됩니다. `configure_telemetry`가
+  `OTEL_SEMCONV_STABILITY_OPT_IN`을 기본값으로 설정합니다 (이미 지정했다면 건드리지 않음).
+* **종료 시 flush합니다.** span·log 프로세서는 배치로 보내므로, lifespan 종료에서
+  `telemetry.shutdown()`을 호출하지 않으면 마지막 몇 초가 사라집니다. 컨테이너가 재시작
+  되는 이유가 담긴, 바로 그 몇 초입니다.
+
+### 확인 방법
+
+내보내는 내용을 눈으로 보려면 콘솔 익스포터를 켜면 됩니다.
+
+```bash
+ES_MCP_TELEMETRY_ENABLED=true ES_MCP_TELEMETRY_CONSOLE_EXPORT=true \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+  python -m es_search_mcp
+```
+
+---
+
+## 8. 커스텀 로깅
 
 `logging.py`가 담당하며, 설계상 두 가지 제약을 지킵니다.
 
@@ -450,9 +584,11 @@ docker logs -f <container> | jq 'select(.event | startswith("tool."))'
 | `backend.retry` | 재시도 (`attempt`, `delay_seconds`, `error_code`) |
 | `tool.error` / `tool.unhandled_error` | 에러 경계가 잡은 실패의 상세 |
 | `tool.retrieve.result` | 사용한 `indices`, `method`, `top_k`, `permission_groups`, 결과 개수 |
+| `telemetry.configured` / `telemetry.disabled` | OTLP 내보내기 상태 (§7) |
 
 `request_id`는 백엔드로 나가는 요청의 `X-Request-ID` 헤더로도 전달되므로, MCP 서버
-로그와 백엔드 로그를 같은 키로 이어 붙일 수 있습니다.
+로그와 백엔드 로그를 같은 키로 이어 붙일 수 있습니다. APM trace와의 연결은 `trace.id` /
+`span.id`가 담당합니다 (§7).
 
 `authorization`, `x-api-key`, `api_key`, `password`, `secret`, `token` 필드는 출력
 직전에 `***`로 치환됩니다 (`SENSITIVE_KEYS`). 호출자의 키는 애초에 도구 인자가 아니라
@@ -469,7 +605,7 @@ logger.info("backend.request", fields={"method": "GET", "path": "/indices"})
 
 ---
 
-## 8. 커스텀 에러 처리
+## 9. 커스텀 에러 처리
 
 ### 예외 계층
 
@@ -536,7 +672,7 @@ middleware.py      도구 "바깥"에서 난 에러의 백스톱 + 호출 결과
 
 ---
 
-## 9. 개발
+## 10. 개발
 
 `uv`를 쓰는 경우:
 
@@ -571,6 +707,9 @@ mypy
 * **도구 docstring은 모델이 읽는 문서입니다.** 언제 이 도구를 쓰는지, 다른 도구와
   어떤 순서로 쓰는지를 적습니다. 반환 스키마는 Pydantic 모델이 담당합니다.
 * **모든 도구 본문은 `tool_error_boundary()`로 감쌉니다.**
+* **새 metrics는 `metrics.py`에 계측기와 기록 헬퍼를 함께 추가합니다.** 속성 집합을 한
+  곳에 모아 두어야, 호출처마다 속성 이름이 달라져 대시보드가 깨지는 일이 없습니다.
+  속성에는 호출자 입력을 넣지 않습니다 — 카디널리티가 터집니다.
 * **자격증명은 요청마다 `resolve_credentials()`로 읽습니다.** 클라이언트나 모듈 전역에
   보관하지 않습니다 — 보관하면 동시 호출자끼리 키가 섞입니다.
 * **검색 전략을 추가할 때는 `RetrieveMethod`에 값을 넣고 `RETRIEVE_METHOD_GUIDE`에
@@ -590,6 +729,9 @@ mypy
 | `test_errors.py` | 에러 경계의 변환과 마스킹 |
 | `test_logging.py` | 포맷터, 컨텍스트 바인딩, 마스킹, stderr 보장 |
 | `test_server_tools.py` | 실제 ASGI 앱을 통한 전 계층 통합 (도구명·인자·자격증명) |
+| `test_telemetry.py` | 켜짐 판정, resource 속성, 로그 브리지, shutdown |
+| `test_metrics.py` | 계측기와 각 측정이 싣는 속성 (in-memory reader) |
+| `test_telemetry_integration.py` | 실제 MCP 호출로 만들어진 실제 span·metrics·로그 상관관계 |
 
 통합 테스트는 실제 ASGI 앱을 인프로세스로 띄워(`httpx2.ASGITransport`, 소켓 없음)
 자격증명 헤더까지 실제 경로로 지나갑니다. MCP 클라이언트는 `httpx2`를, 백엔드 클라이언트는

@@ -1,9 +1,9 @@
 """Assembly of the FastMCP server.
 
-``create_server`` is the single composition root: it builds the settings, the
-backend client, the middleware stack and the tools, and wires the client's
-lifetime to the server's lifespan. Everything below this module is free of
-global state, which keeps each piece testable on its own.
+``create_server`` is the single composition root: it builds the settings,
+telemetry, the backend client, the middleware stack and the tools, and wires
+their lifetimes to the server's lifespan. Everything below this module is free
+of global state, which keeps each piece testable on its own.
 """
 
 from __future__ import annotations
@@ -12,11 +12,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP
+from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from starlette.middleware import Middleware as ASGIMiddleware
 
 from es_search_mcp.backend import SearchBackendClient
 from es_search_mcp.config import Settings, load_settings
 from es_search_mcp.logging import configure_logging, get_logger
 from es_search_mcp.middleware import CallLoggingMiddleware, ErrorHandlingMiddleware
+from es_search_mcp.telemetry import Telemetry, configure_telemetry
 from es_search_mcp.tools import register_index_tools, register_retrieve_tools
 
 logger = get_logger(__name__)
@@ -60,9 +64,16 @@ def create_server(
     """
     settings = settings or load_settings()
     configure_logging(level=settings.log_level, log_format=settings.log_format)
+    # After logging, because the OTLP log bridge attaches to the logger that
+    # call sets up; before the tools, so the spans they emit are recorded.
+    telemetry = configure_telemetry(settings)
 
     owns_client = client is None
     backend_client = client or SearchBackendClient(settings)
+    if telemetry.enabled:
+        # Instrument this client only, rather than patching httpx process-wide:
+        # the spans should cover the calls this server makes and nothing else.
+        HTTPXClientInstrumentor.instrument_client(backend_client.http_client)
 
     @asynccontextmanager
     async def lifespan(_: FastMCP) -> AsyncIterator[dict[str, object]]:
@@ -75,11 +86,18 @@ def create_server(
             },
         )
         try:
-            yield {"settings": settings, "backend_client": backend_client}
+            yield {
+                "settings": settings,
+                "backend_client": backend_client,
+                "telemetry": telemetry,
+            }
         finally:
             if owns_client:
                 await backend_client.aclose()
             logger.info("server.stopped", fields={"server": SERVER_NAME})
+            # Last, so the shutdown log line above is still exported: the batch
+            # processors are flushed here and nothing leaves the process after.
+            telemetry.shutdown()
 
     mcp: FastMCP = FastMCP(
         name=SERVER_NAME,
@@ -90,7 +108,7 @@ def create_server(
         middleware=[
             # Logging is outermost so it observes exceptions before the error
             # middleware rewrites them into a ToolError.
-            CallLoggingMiddleware(),
+            CallLoggingMiddleware(log_arguments=settings.log_tool_arguments),
             ErrorHandlingMiddleware(mask_unexpected=settings.mask_error_details),
         ],
     )
@@ -98,6 +116,28 @@ def create_server(
     register_index_tools(mcp, backend_client, settings)
     register_retrieve_tools(mcp, backend_client, settings)
     return mcp
+
+
+def asgi_middleware(telemetry: Telemetry) -> list[ASGIMiddleware] | None:
+    """ASGI middleware for the HTTP transports.
+
+    Wrapping the app in OpenTelemetry's ASGI middleware gives each inbound HTTP
+    request a SERVER span that parents FastMCP's MCP span, so a trace in APM
+    starts at the request rather than halfway down. Returns ``None`` when export
+    is off, so an unconfigured deployment pays nothing for it.
+    """
+    if not telemetry.enabled:
+        return None
+    return [
+        ASGIMiddleware(
+            OpenTelemetryMiddleware,
+            # Without this, every request also produces an internal span per
+            # ASGI message — three quarters of the spans in a trace, none of
+            # them telling anyone anything. They cost ingest and obscure the
+            # request / MCP call / backend call chain that matters.
+            exclude_spans=["receive", "send"],
+        )
+    ]
 
 
 def run() -> None:
@@ -115,4 +155,5 @@ def run() -> None:
             host=settings.host,
             port=settings.port,
             show_banner=False,
+            middleware=asgi_middleware(configure_telemetry(settings)),
         )
